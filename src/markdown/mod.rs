@@ -15,7 +15,7 @@ use pulldown_cmark::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::code;
-use crate::doc::{hard_wrap, wrap, Doc};
+use crate::doc::{hard_wrap, wrap, Doc, Row};
 use crate::fetch;
 use crate::raster::{compose_row, Picture, Raster};
 use crate::ui::{spans_width, Rgb, Span, Style, Theme};
@@ -343,6 +343,8 @@ struct Renderer<'a> {
     center: Vec<bool>,
     /// Suppress the next block gap (directly after an alert title).
     no_gap: bool,
+    /// Task list checkboxes to draw as icons: (row, column, checked).
+    checkboxes: Vec<(usize, u32, bool)>,
 }
 
 impl<'a> Renderer<'a> {
@@ -365,6 +367,7 @@ impl<'a> Renderer<'a> {
             in_code_span: false,
             center: Vec::new(),
             no_gap: false,
+            checkboxes: Vec::new(),
         }
     }
 
@@ -402,8 +405,15 @@ impl<'a> Renderer<'a> {
                 Block::Quote { color } => out.push(Span::new("▎ ", Style::fg(*color))),
                 Block::Item { marker, indent } => {
                     if consume {
-                        if let Some(m) = marker.take() {
+                        if let Some(mut m) = marker.take() {
                             let pad = indent.saturating_sub(m.width());
+                            if self.o.graphics && (m.text == "☐ " || m.text == "☑ ") {
+                                let col =
+                                    out.iter().map(|s: &Span| s.width()).sum::<usize>() as u32;
+                                self.checkboxes
+                                    .push((self.doc.rows.len(), col, m.text == "☑ "));
+                                m.text = "  ".into();
+                            }
                             out.push(m);
                             if pad > 0 {
                                 out.push(Span::plain(" ".repeat(pad)));
@@ -1396,6 +1406,16 @@ impl<'a> Renderer<'a> {
 
     fn finish(mut self) -> Doc {
         self.flush_inline();
+        let (cw, ch) = self.o.cell;
+        let (w, h) = ((cw * 2.0).round() as u32, ch.round() as u32);
+        let rgb = |c: Rgb| (c.0, c.1, c.2);
+        for (row, col, checked) in std::mem::take(&mut self.checkboxes) {
+            if matches!(self.doc.rows.get(row), Some(Row::Text { .. })) {
+                let raster =
+                    crate::raster::checkbox(checked, w, h, rgb(self.t.accent), rgb(self.t.muted));
+                self.doc.icon(raster, row, col, 2);
+            }
+        }
         if let Some(level) = self.heading {
             let _ = level;
             self.end_heading();

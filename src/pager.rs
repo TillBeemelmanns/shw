@@ -358,6 +358,49 @@ fn draw(ctx: &Ctx, doc: &mut Doc, st: &State, ws: WinSize, src: &dyn Source, pos
         }
     }
 
+    // Icons (task list checkboxes) are drawn over their text row.
+    for im in doc.images.iter_mut().filter(|im| im.icon) {
+        if im.start < st.top || im.start >= st.top + view {
+            continue;
+        }
+        let r = im.start - st.top;
+        let col = im.col as usize + m + 1;
+        if ctx.kitty.placeholders {
+            if !im.sent {
+                ctx.kitty.transmit(
+                    &mut out,
+                    &im.raster,
+                    &format!("a=T,U=1,i={},c={},r=1", im.id, im.cols),
+                );
+                im.sent = true;
+            }
+            out.extend_from_slice(
+                format!(
+                    "\x1b[{};{col}H{}",
+                    r + 1,
+                    placeholder_row(im.id, 0, im.cols)
+                )
+                .as_bytes(),
+            );
+        } else {
+            if !im.sent {
+                ctx.kitty
+                    .transmit(&mut out, &im.raster, &format!("a=t,i={}", im.id));
+                im.sent = true;
+            }
+            let s = format!(
+                "\x1b[{};{col}H\x1b_Ga=p,i={},p=1,C=1,q=2\x1b\\",
+                r + 1,
+                im.id
+            );
+            if ctx.kitty.tmux {
+                out.extend_from_slice(crate::kitty::tmux_wrap(&s).as_bytes());
+            } else {
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+
     // status bar
     let total = doc.rows.len();
     let pct = if total <= view {
@@ -392,8 +435,23 @@ pub fn print_doc(ctx: &Ctx, doc: &mut Doc, width: usize) {
         match &doc.rows[i] {
             Row::Text { spans, fill, scale } => {
                 render_text(&mut line, spans, *fill, *scale, width, None, None);
-                line.push('\n');
                 out.extend_from_slice(line.as_bytes());
+                for im in doc.images.iter_mut().filter(|im| im.icon && im.start == i) {
+                    out.extend_from_slice(format!("\x1b[{}G", im.col + 1).as_bytes());
+                    if ctx.kitty.placeholders {
+                        ctx.kitty.transmit(
+                            &mut out,
+                            &im.raster,
+                            &format!("a=T,U=1,i={},c={},r=1", im.id, im.cols),
+                        );
+                        out.extend_from_slice(placeholder_row(im.id, 0, im.cols).as_bytes());
+                    } else {
+                        ctx.kitty
+                            .transmit(&mut out, &im.raster, &format!("a=T,i={},C=1", im.id));
+                    }
+                    im.sent = true;
+                }
+                out.push(b'\n');
             }
             Row::Cont => out.push(b'\n'),
             Row::Image { img, prefix, .. } => {

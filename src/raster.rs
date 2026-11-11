@@ -455,6 +455,60 @@ pub fn render_text_line(text: &str, size: f64, h: u32, color: (u8, u8, u8)) -> O
     Some(render_svg(&tree, (0.0, 0.0, w, h as f64), w as u32, h))
 }
 
+/// GitHub-style task list checkbox drawn into a `w` x `h` (2 x 1 cells) raster.
+pub fn checkbox(
+    checked: bool,
+    w: u32,
+    h: u32,
+    accent: (u8, u8, u8),
+    border: (u8, u8, u8),
+) -> Raster {
+    let body = h as f64 / 1.22;
+    let size = (body * 0.82).round().max(6.0);
+    let x = (w as f64 * 0.08).round();
+    let y = ((h as f64 - size) / 2.0).round();
+    let r = (size * 0.2).max(1.5);
+    let stroke = (size / 11.0).max(1.0);
+    let hex = |c: (u8, u8, u8)| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2);
+    let shape = if checked {
+        // tick inside a filled box
+        let (x0, y0, s) = (x, y, size);
+        format!(
+            r#"<rect x="{x0}" y="{y0}" width="{s}" height="{s}" rx="{r}" fill="{a}"/><path d="M {} {} L {} {} L {} {}" fill="none" stroke="white" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round"/>"#,
+            x0 + s * 0.24,
+            y0 + s * 0.52,
+            x0 + s * 0.43,
+            y0 + s * 0.70,
+            x0 + s * 0.77,
+            y0 + s * 0.32,
+            s * 0.13,
+            a = hex(accent)
+        )
+    } else {
+        let half = stroke / 2.0;
+        format!(
+            r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{r}" fill="none" stroke="{}" stroke-width="{stroke}"/>"#,
+            x + half,
+            y + half,
+            size - stroke,
+            size - stroke,
+            hex(border)
+        )
+    };
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{shape}</svg>"#
+    );
+    match parse_svg(svg.as_bytes(), None) {
+        Ok(tree) => render_svg(&tree, (0.0, 0.0, w as f64, h as f64), w, h),
+        Err(_) => Raster {
+            w,
+            h,
+            ch: 4,
+            data: vec![0; (w * h * 4) as usize],
+        },
+    }
+}
+
 /// Load the system font database in the background so the first heading is fast.
 pub fn warm_fonts() {
     std::thread::spawn(|| {

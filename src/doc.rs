@@ -35,6 +35,8 @@ pub struct DocImage {
     pub sent: bool,
     /// Text represented by the image (headings), used for search.
     pub alt: String,
+    /// Small image drawn over a text row (task list checkbox) instead of on its own rows.
+    pub icon: bool,
 }
 
 #[derive(Default)]
@@ -112,6 +114,7 @@ impl Doc {
             id: crate::kitty::next_id(),
             sent: false,
             alt,
+            icon: false,
         });
         for r in 0..rows {
             self.rows.push(Row::Image {
@@ -120,6 +123,21 @@ impl Doc {
                 prefix: prefix.clone(),
             });
         }
+    }
+
+    /// Overlay a 1-row icon image at `col` on the existing text row `row`.
+    pub fn icon(&mut self, raster: Raster, row: usize, col: u32, cols: u32) {
+        self.images.push(DocImage {
+            raster,
+            cols,
+            rows: 1,
+            col,
+            start: row,
+            id: crate::kitty::next_id(),
+            sent: false,
+            alt: String::new(),
+            icon: true,
+        });
     }
 
     pub fn plain(&self, i: usize) -> String {

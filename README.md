@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/shw.svg)](https://crates.io/crates/shw)
 [![license](https://img.shields.io/crates/l/shw.svg)](#license)
 
-**shw** (*show*) is a very fast terminal viewer for **images**, **videos** and **GitHub-flavored Markdown**.
+**shw** (*show*) is a very simple terminal viewer for **images**, **videos** and **Markdown** based on Rust.
 It renders with pixel precision through the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 
 ```sh
@@ -193,4 +193,4 @@ cargo run -- README.md
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Licensed under [MIT](LICENSE-MIT)
