@@ -36,17 +36,19 @@ pub fn fetch(url: &str) -> Result<Vec<u8>> {
     use std::time::Duration;
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     let agent = AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_global(Some(Duration::from_secs(20)))
             .user_agent(concat!("shw/", env!("CARGO_PKG_VERSION")))
             .build()
+            .new_agent()
     });
-    let resp = agent.get(url).call().map_err(|e| anyhow!("{url}: {e}"))?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(128 * 1024 * 1024)
-        .read_to_end(&mut buf)
+    let mut resp = agent.get(url).call().map_err(|e| anyhow!("{url}: {e}"))?;
+    let buf = resp
+        .body_mut()
+        .with_config()
+        .limit(128 * 1024 * 1024)
+        .read_to_vec()
         .with_context(|| format!("failed to download {url}"))?;
     Ok(buf)
 }
