@@ -71,7 +71,7 @@ jobs:
           name="shw-${GITHUB_REF_NAME}-${{ matrix.target }}"
           bin="target/${{ matrix.target }}/release/shw"
           mkdir -p "dist/${name}/completions"
-          cp "$bin" README.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
+          cp "$bin" README.md LICENSE "dist/${name}/"
           # completions need a binary that runs on the build host
           gen="$bin"
           if ! "$gen" --version > /dev/null 2>&1; then

@@ -194,4 +194,4 @@ cargo run -- README.md
 
 ## License
 
-Licensed under [MIT](LICENSE-MIT)
+Licensed under [MIT](LICENSE)
