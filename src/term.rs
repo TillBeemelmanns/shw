@@ -184,8 +184,8 @@ fn poll_read(fd: i32, timeout: Duration) -> bool {
         return false;
     }
     let mut tv = libc::timeval {
-        tv_sec: timeout.as_secs().min(3600) as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        tv_sec: timeout.as_secs().min(3600) as _,
+        tv_usec: timeout.subsec_micros() as _,
     };
     // SAFETY: fd_set on the stack, initialised by FD_ZERO; fd < FD_SETSIZE.
     unsafe {
