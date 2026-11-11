@@ -37,6 +37,8 @@ pub struct LayoutOpts<'a> {
     pub offline: bool,
     /// Maximum image height in pixels.
     pub max_img_h: f64,
+    /// Text colour used for typeset (image) headings.
+    pub fg: Rgb,
 }
 
 type Cache = HashMap<String, Option<Arc<Picture>>>;
@@ -49,6 +51,7 @@ pub struct Markdown {
 
 impl Markdown {
     pub fn new(src: String, base: Base) -> Self {
+        crate::raster::warm_fonts();
         Markdown {
             src,
             base,
@@ -808,6 +811,9 @@ impl<'a> Renderer<'a> {
         if spans.iter().all(|s| s.text.trim().is_empty()) {
             return;
         }
+        if level <= 3 && self.o.graphics && self.heading_image(&spans, level) {
+            return;
+        }
         let top_level = self.blocks.is_empty();
         let scale: u8 = if level == 1 && self.o.text_sizing && top_level {
             2
@@ -834,6 +840,71 @@ impl<'a> Renderer<'a> {
             p.push(Span::new(ch.repeat(cw), Style::fg(self.t.border)));
             self.doc.text(p);
         }
+    }
+
+    /// GitHub-style large heading typeset with a real font and shown as an
+    /// image (works in every kitty-graphics terminal, unlike text sizing).
+    fn heading_image(&mut self, spans: &[Span], level: u8) -> bool {
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return false;
+        }
+        let (cw_px, ch_px) = self.o.cell;
+        // terminal body text is roughly cell height / 1.22; GitHub: h1 2em, h2 1.5em, h3 1.25em
+        let body = ch_px / 1.22;
+        let size = body * [2.0, 1.5, 1.25][(level - 1) as usize];
+        let rows = ((size * 1.32) / ch_px).ceil().max(1.0) as u32;
+        let h = (rows as f64 * ch_px).round() as u32;
+        let cw = self.content_width();
+        let avail = cw as f64 * cw_px - 2.0;
+
+        // greedy word wrap by measured width
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for word in text.split(' ') {
+            let cand = if cur.is_empty() {
+                word.to_string()
+            } else {
+                format!("{cur} {word}")
+            };
+            match crate::raster::text_width(&cand, size) {
+                None => return false,
+                Some(w) if w > avail && !cur.is_empty() => {
+                    lines.push(std::mem::replace(&mut cur, word.to_string()));
+                }
+                _ => cur = cand,
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        let color = (self.o.fg.0, self.o.fg.1, self.o.fg.2);
+        let mut rendered = Vec::new();
+        for l in &lines {
+            match crate::raster::render_text_line(l, size, h, color) {
+                Some(r) => rendered.push((r, l.clone())),
+                None => return false,
+            }
+        }
+        for (raster, alt) in rendered {
+            let cols = ((raster.w as f64 / cw_px).ceil() as u32)
+                .min(cw as u32)
+                .max(1);
+            let mut col = self.prefix_width() as u32;
+            if self.centered() && cols < cw as u32 {
+                col += (cw as u32 - cols) / 2;
+            }
+            let p = self.prefix(true);
+            let prefix: Vec<Span> = p.into_iter().filter(|s| s.text.contains('▎')).collect();
+            self.doc.image_alt(raster, col, cols, rows, prefix, alt);
+        }
+        if level <= 2 {
+            let mut p = self.prefix(false);
+            p.push(Span::new("─".repeat(cw), Style::fg(self.t.border)));
+            self.doc.text(p);
+        }
+        true
     }
 
     // -- inline flow --------------------------------------------------------
@@ -1465,6 +1536,7 @@ mod tests {
         let theme = Theme::new(true);
         let o = LayoutOpts {
             width,
+            fg: Rgb(255, 255, 255),
             cell: (10.0, 20.0),
             theme: &theme,
             text_sizing: false,

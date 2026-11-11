@@ -261,6 +261,7 @@ fn run() -> Result<()> {
             }
         }
     }
+    let caps_dark = caps.dark;
     let dark = match cli.theme {
         ThemeArg::Auto => caps.dark,
         ThemeArg::Dark => true,
@@ -283,7 +284,7 @@ fn run() -> Result<()> {
         env,
         caps,
         kitty,
-        theme: Theme::new(dark),
+        theme: Theme::for_bg(dark, caps_dark),
         opts: Opts {
             width: cli.width,
             height: cli.height,
@@ -339,6 +340,12 @@ fn md_opts<'a>(ctx: &'a Ctx, ws: WinSize, width: usize) -> LayoutOpts<'a> {
         graphics: ctx.caps.graphics,
         offline: ctx.opts.offline,
         max_img_h: (ws.rows.saturating_sub(3).max(4) as f64) * ch,
+        fg: match (ctx.theme.page, ctx.caps.fg) {
+            (Some((fg, _)), _) => fg,
+            (None, Some((r, g, b))) => ui::Rgb(r, g, b),
+            (None, None) if ctx.theme.dark => ui::Rgb::hex(0xf0f6fc),
+            (None, None) => ui::Rgb::hex(0x1f2328),
+        },
     }
 }
 

@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 
-use crate::app::{is_quit, pos_label, read_events, Ctx, Nav};
+use crate::app::{is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS};
 use crate::kitty::{next_id, placeholder_row};
 use crate::raster::{render_svg, resize, resize_region, Filter, Picture, Raster};
 use crate::term::WinSize;
-use crate::ui::{help_screen, status_bar};
+use crate::ui::{help_screen, hint_bar, status_bar};
 
 const HELP: &[(&str, &str)] = &[
     ("wheel / + / -", "zoom (at pointer)"),
@@ -22,6 +22,20 @@ const HELP: &[(&str, &str)] = &[
     ("n / p / → / ←", "next / previous file"),
     ("q / Esc", "quit"),
 ];
+
+const HINTS: &[(&str, &str)] = &[
+    ("wheel/+-", "zoom"),
+    ("drag/hjkl", "pan"),
+    ("0", "fit"),
+    ("1", "100%"),
+    ("r", "rotate"),
+    ("n/p", "next/prev"),
+    ("space", "next/pause"),
+];
+
+/// Zoom factor per mouse-wheel notch / key press.
+const WHEEL_STEP: f64 = 1.15;
+const KEY_STEP: f64 = 1.25;
 
 struct Viewer<'a> {
     ctx: &'a Ctx,
@@ -42,6 +56,8 @@ struct Viewer<'a> {
     hq_due: Option<Instant>,
     drag: Option<(u16, u16)>,
     help: bool,
+    /// Downscaled copies (1/2, 1/4, …) of the first frame for fast zoomed-out rendering.
+    mips: Vec<Raster>,
 }
 
 impl<'a> Viewer<'a> {
@@ -53,8 +69,50 @@ impl<'a> Viewer<'a> {
         let (cw, ch) = ws.cell();
         (
             ws.cols as f64 * cw,
-            ws.rows.saturating_sub(1).max(1) as f64 * ch,
+            ws.rows.saturating_sub(CHROME_ROWS).max(1) as f64 * ch,
         )
+    }
+
+    fn zoom_limits(&self, ws: WinSize) -> (f64, f64) {
+        let min = self.fit(ws).min(1.0);
+        let max: f64 = if self.pic.svg.is_some() { 400.0 } else { 64.0 };
+        (min, max.max(min))
+    }
+
+    fn zoom_by(&mut self, ws: WinSize, factor: f64, anchor: Option<(f64, f64)>) {
+        self.set_zoom(ws, self.zoom * factor, anchor);
+    }
+
+    /// Pick the smallest mip level that still has at least `z` resolution.
+    fn source_for(&mut self, z: f64) -> (usize, f64) {
+        if self.pic.is_animated() || self.pic.svg.is_some() {
+            return (0, 1.0);
+        }
+        let mut level = 0;
+        let mut scale = 1.0;
+        while scale * 0.5 >= z * 1.05 {
+            let prev = if level == 0 {
+                &self.pic.frames[0].raster
+            } else {
+                &self.mips[level - 1]
+            };
+            if prev.w < 64 || prev.h < 64 {
+                break;
+            }
+            if self.mips.len() < level + 1 {
+                let half = resize_region(
+                    prev,
+                    (0.0, 0.0, prev.w as f64, prev.h as f64),
+                    prev.w.div_ceil(2),
+                    prev.h.div_ceil(2),
+                    Filter::Bilinear,
+                );
+                self.mips.push(half);
+            }
+            level += 1;
+            scale *= 0.5;
+        }
+        (level, scale)
     }
 
     fn fit(&self, ws: WinSize) -> f64 {
@@ -82,9 +140,8 @@ impl<'a> Viewer<'a> {
     }
 
     fn set_zoom(&mut self, ws: WinSize, z: f64, anchor: Option<(f64, f64)>) {
-        let min = self.fit(ws).min(1.0);
-        let max: f64 = if self.pic.svg.is_some() { 400.0 } else { 64.0 };
-        let z = z.clamp(min, max.max(min));
+        let (min, max) = self.zoom_limits(ws);
+        let z = z.clamp(min, max);
         let (aw, ah) = self.area(ws);
         // keep the source point under the anchor fixed
         let (dx, dy) = anchor
@@ -128,10 +185,22 @@ impl<'a> Viewer<'a> {
             disp_h.round().max(1.0) as u32,
         );
 
+        let (level, scale) = self.source_for(z);
         let raster: Raster = if let Some(tree) = &self.pic.svg {
             render_svg(tree, crop, dw, dh)
         } else {
-            let src = &self.pic.frames[self.frame].raster;
+            let src = if level == 0 {
+                &self.pic.frames[self.frame].raster
+            } else {
+                &self.mips[level - 1]
+            };
+            let crop = (
+                crop.0 * scale,
+                crop.1 * scale,
+                crop.2 * scale,
+                crop.3 * scale,
+            );
+            let (iw, ih) = (src.w as f64, src.h as f64);
             let f = if z >= 4.0 { Filter::Nearest } else { filter };
             if crop.0 == 0.0 && crop.1 == 0.0 && dw == src.w && dh == src.h {
                 src.clone()
@@ -182,7 +251,10 @@ impl<'a> Viewer<'a> {
             k.transmit(
                 &mut out,
                 &raster,
-                &format!("a=T,i={new_id},p=1,X={xo},Y={yo},C=1"),
+                &format!(
+                    "a=T,i={new_id},p=1,X={xo},Y={yo},C=1,{}",
+                    crate::kitty::Z_BELOW_BG
+                ),
             );
         }
         if self.shown {
@@ -211,7 +283,7 @@ impl<'a> Viewer<'a> {
         };
         let left = format!("{}{}", self.name, pos_label(self.pos));
         let right = format!(
-            "{}×{}  {}  {}{}  {:.0}%  ? help",
+            "{}×{}  {}  {}{}  {:.0}%",
             self.pic.width,
             self.pic.height,
             self.pic.format,
@@ -219,7 +291,14 @@ impl<'a> Viewer<'a> {
             anim,
             self.zoom * 100.0
         );
-        status_bar(&self.ctx.theme, ws.rows, ws.cols, "IMG", &left, &right)
+        let mut s = status_bar(&self.ctx.theme, ws.rows - 1, ws.cols, "IMG", &left, &right);
+        let hints: &[(&str, &str)] = if self.pic.is_animated() {
+            HINTS
+        } else {
+            &HINTS[..HINTS.len() - 1]
+        };
+        s.push_str(&hint_bar(&self.ctx.theme, ws.rows, ws.cols, hints));
+        s
     }
 
     fn clear(&mut self) {
@@ -254,6 +333,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         hq_due: None,
         drag: None,
         help: false,
+        mips: Vec::new(),
     };
     let mut ws = ctx.size();
     v.reset(ws);
@@ -270,8 +350,8 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                         .as_bytes(),
                 );
             } else {
-                // Large renders: draw fast while interacting, refine when idle.
-                let fast = interactive && v.last_render > Duration::from_millis(45);
+                // While zooming / dragging, draw with a fast filter; refine when idle.
+                let fast = interactive && v.last_render > Duration::from_millis(20);
                 v.render(
                     ws,
                     if fast {
@@ -280,7 +360,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                         Filter::Lanczos
                     },
                 );
-                v.hq_due = fast.then(|| Instant::now() + Duration::from_millis(140));
+                v.hq_due = fast.then(|| Instant::now() + Duration::from_millis(120));
             }
             if animated && !v.paused && v.next_frame.is_none() {
                 v.next_frame = Some(Instant::now() + v.pic.frames[v.frame].delay);
@@ -343,12 +423,12 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                     ));
                     match m.kind {
                         MouseEventKind::ScrollUp => {
-                            v.set_zoom(ws, v.zoom * 1.2, anchor);
+                            v.zoom_by(ws, WHEEL_STEP, anchor);
                             dirty = true;
                             interactive = true;
                         }
                         MouseEventKind::ScrollDown => {
-                            v.set_zoom(ws, v.zoom / 1.2, anchor);
+                            v.zoom_by(ws, 1.0 / WHEEL_STEP, anchor);
                             dirty = true;
                             interactive = true;
                         }
@@ -378,12 +458,11 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                     dirty = true;
                     match k.code {
                         KeyCode::Char('+') | KeyCode::Char('=') => {
-                            v.set_zoom(ws, v.zoom * 1.25, None);
+                            v.zoom_by(ws, KEY_STEP, None);
                             interactive = true;
                         }
                         KeyCode::Char('-') | KeyCode::Char('_') => {
-                            v.set_zoom(ws, v.zoom / 1.25, None);
-                            interactive = true;
+                            v.zoom_by(ws, 1.0 / KEY_STEP, None)
                         }
                         KeyCode::Char('0') | KeyCode::Char('f') => {
                             let fit = v.fit(ws);
@@ -409,6 +488,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                                 }
                             }
                             std::mem::swap(&mut v.pic.width, &mut v.pic.height);
+                            v.mips.clear();
                             v.clear();
                             v.reset(ws);
                         }

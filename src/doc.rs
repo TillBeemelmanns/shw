@@ -33,6 +33,8 @@ pub struct DocImage {
     pub start: usize,
     pub id: u32,
     pub sent: bool,
+    /// Text represented by the image (headings), used for search.
+    pub alt: String,
 }
 
 #[derive(Default)]
@@ -87,6 +89,18 @@ impl Doc {
 
     /// Add an image with given cell geometry; `prefix` is drawn left of each row.
     pub fn image(&mut self, raster: Raster, col: u32, cols: u32, rows: u32, prefix: Vec<Span>) {
+        self.image_alt(raster, col, cols, rows, prefix, String::new());
+    }
+
+    pub fn image_alt(
+        &mut self,
+        raster: Raster,
+        col: u32,
+        cols: u32,
+        rows: u32,
+        prefix: Vec<Span>,
+        alt: String,
+    ) {
         let idx = self.images.len();
         let start = self.rows.len();
         self.images.push(DocImage {
@@ -97,6 +111,7 @@ impl Doc {
             start,
             id: crate::kitty::next_id(),
             sent: false,
+            alt,
         });
         for r in 0..rows {
             self.rows.push(Row::Image {
@@ -110,6 +125,7 @@ impl Doc {
     pub fn plain(&self, i: usize) -> String {
         match &self.rows[i] {
             Row::Text { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
+            Row::Image { img, row: 0, .. } => self.images[*img].alt.clone(),
             _ => String::new(),
         }
     }
@@ -123,8 +139,9 @@ pub fn render_text(
     scale: u8,
     width: usize,
     hl: Option<(&str, Rgb)>,
+    base: Option<(Rgb, Rgb)>,
 ) {
-    write_spans(out, spans, scale, hl);
+    write_spans(out, spans, scale, hl, base);
     if let Some(Rgb(r, g, b)) = fill {
         let w = spans_width(spans) * scale as usize;
         if w < width {

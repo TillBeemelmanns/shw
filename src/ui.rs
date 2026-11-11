@@ -1,6 +1,7 @@
 //! Colours, styled text spans and status bar rendering.
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -32,6 +33,23 @@ pub struct Theme {
     pub caution: Rgb,
     pub search_bg: Rgb,
     pub syntect: &'static str,
+    /// Explicit page (fg, bg) when the theme differs from the terminal background.
+    pub page: Option<(Rgb, Rgb)>,
+}
+
+/// Theme chosen interactively (`t`), remembered for the rest of the session.
+static THEME_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_theme_override(dark: bool) {
+    THEME_OVERRIDE.store(if dark { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+pub fn theme_override() -> Option<bool> {
+    match THEME_OVERRIDE.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
 }
 
 impl Theme {
@@ -54,6 +72,7 @@ impl Theme {
                 caution: Rgb::hex(0xf85149),
                 search_bg: Rgb::hex(0x9e6a03),
                 syntect: "base16-ocean.dark",
+                page: None,
             }
         } else {
             Theme {
@@ -73,8 +92,23 @@ impl Theme {
                 caution: Rgb::hex(0xd1242f),
                 search_bg: Rgb::hex(0xfff8c5),
                 syntect: "InspiredGitHub",
+                page: None,
             }
         }
+    }
+
+    /// Palette for `dark`; paints its own page colours when the terminal
+    /// background (`terminal_dark`) does not match, e.g. a bright page in a dark terminal.
+    pub fn for_bg(dark: bool, terminal_dark: bool) -> Theme {
+        let mut t = Theme::new(dark);
+        if dark != terminal_dark {
+            t.page = Some(if dark {
+                (Rgb::hex(0xf0f6fc), Rgb::hex(0x0d1117))
+            } else {
+                (Rgb::hex(0x1f2328), Rgb::hex(0xffffff))
+            });
+        }
+        t
     }
 }
 
@@ -154,7 +188,13 @@ pub fn spans_width(spans: &[Span]) -> usize {
 }
 
 /// Write spans as ANSI text. `scale` > 1 uses the kitty text sizing protocol.
-pub fn write_spans(out: &mut String, spans: &[Span], scale: u8, highlight: Option<(&str, Rgb)>) {
+pub fn write_spans(
+    out: &mut String,
+    spans: &[Span],
+    scale: u8,
+    highlight: Option<(&str, Rgb)>,
+    base: Option<(Rgb, Rgb)>,
+) {
     let owned;
     let spans = match highlight {
         Some((q, bg)) if !q.is_empty() => {
@@ -173,7 +213,15 @@ pub fn write_spans(out: &mut String, spans: &[Span], scale: u8, highlight: Optio
             }
             cur_link = link;
         }
-        s.style.sgr(out);
+        match base {
+            Some((fg, bg)) => {
+                let mut st = s.style.clone();
+                st.fg.get_or_insert(fg);
+                st.bg.get_or_insert(bg);
+                st.sgr(out);
+            }
+            None => s.style.sgr(out),
+        }
         if scale > 1 {
             // OSC 66 payloads are limited to 4096 bytes; split long spans.
             let mut buf = String::new();
@@ -373,6 +421,53 @@ pub fn help_screen(
         y0 + 3 + keys.len(),
         "─".repeat(bw - 2)
     ));
+    s
+}
+
+/// Bottom line listing the key bindings: `key label` pairs, as many as fit;
+/// `? help` and `q quit` are always shown at the right edge.
+pub fn hint_bar(theme: &Theme, row: u16, cols: u16, items: &[(&str, &str)]) -> String {
+    let cols = cols as usize;
+    let mut key = String::new();
+    Style {
+        fg: Some(theme.accent),
+        bg: Some(theme.bar_bg),
+        bold: true,
+        ..Default::default()
+    }
+    .sgr(&mut key);
+    let mut label = String::new();
+    Style {
+        fg: Some(theme.muted),
+        bg: Some(theme.bar_bg),
+        ..Default::default()
+    }
+    .sgr(&mut label);
+    let fmt = |k: &str, l: &str| format!("{key}{k}{label} {l}");
+    let width = |k: &str, l: &str| k.width() + 1 + l.width();
+    let tail = [("?", "help"), ("q", "quit")];
+    let tail_w: usize = tail.iter().map(|(k, l)| width(k, l) + 2).sum();
+    let mut s = format!("\x1b[{row};1H{label}\x1b[2K ");
+    let mut used = 1;
+    for (k, l) in items {
+        let w = width(k, l) + 2;
+        if used + w + tail_w > cols {
+            break;
+        }
+        s.push_str(&fmt(k, l));
+        s.push_str("  ");
+        used += w;
+    }
+    let pad = cols.saturating_sub(used + tail_w);
+    s.push_str(&" ".repeat(pad));
+    for (k, l) in tail {
+        if used + width(k, l) + 2 <= cols {
+            s.push_str(&fmt(k, l));
+            s.push_str("  ");
+            used += width(k, l) + 2;
+        }
+    }
+    s.push_str("\x1b[0m");
     s
 }
 

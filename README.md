@@ -28,8 +28,8 @@ shw ~/Pictures         # browse a folder (n / p)
     **zoom and pan inside the video**, and saving a frame as PNG.
   - Audio via `ffplay`; it is turned off automatically over ssh.
 - **Markdown**, rendered close to the way github.com renders it:
-  - headings with rules (H1 at double size on terminals with the
-    [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/)), bold, italic and strikethrough
+  - large semibold headings like GitHub's (H1 2×, H2 1.5×, H3 1.25×), typeset with a system font and drawn as
+    images so they work in every kitty-graphics terminal; plus bold, italic and strikethrough
   - syntax-highlighted code blocks, tables with alignment and zebra striping, task lists, footnotes, and
     `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` alerts
   - `:emoji:` shortcodes and clickable links (OSC 8)
@@ -112,9 +112,10 @@ With no arguments, `shw` reads stdin if it is piped, otherwise opens `README.md`
 | `1` | 100 % | click bar | seek | `g` `G` | top / bottom |
 | `r` `R` | rotate | wheel, `+` `-` `0` | zoom | `/` `n` `N` | search |
 | `n` `p` | next / prev file | `m` `l` `.` `s` | mute, loop, step, save frame | `Tab` | next file |
+| | | | | `t` | dark / bright theme |
 | `?` | help | `?` | help | `?` | help |
 
-`q` or `Esc` quits everywhere.
+`q` or `Esc` quits everywhere. The bottom line of every viewer lists its keys.
 
 ## Integrations
 

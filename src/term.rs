@@ -123,6 +123,8 @@ pub struct Caps {
     pub shm_transfer: bool,
     pub text_sizing: bool,
     pub dark: bool,
+    /// Default foreground colour reported via OSC 10.
+    pub fg: Option<(u8, u8, u8)>,
     /// Cell size reported via `CSI 16 t` (width, height).
     pub cell_px: Option<(u32, u32)>,
     /// Whether the terminal answered at all (DA1).
@@ -137,6 +139,7 @@ impl Default for Caps {
             shm_transfer: false,
             text_sizing: false,
             dark: true,
+            fg: None,
             cell_px: None,
             responded: false,
         }
@@ -222,6 +225,7 @@ pub fn probe(env: &Env, timeout: Duration) -> Caps {
             b64(&shm_name)
         );
     }
+    q += "\x1b]10;?\x1b\\";
     q += "\x1b]11;?\x1b\\";
     q += "\x1b[16t";
     if !env.tmux {
@@ -263,6 +267,8 @@ pub fn probe(env: &Env, timeout: Duration) -> Caps {
     if let Some(dark) = parse_bg(&s) {
         caps.dark = dark;
     }
+    caps.fg = parse_osc_rgb(&s, "10")
+        .map(|(r, g, b)| ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8));
     caps.cell_px = parse_cell_size(&s);
     caps.text_sizing = parse_cpr_col(&s) == Some(3);
     if env.tmux {
@@ -290,7 +296,15 @@ fn has_da1(buf: &[u8]) -> bool {
 }
 
 fn parse_bg(s: &str) -> Option<bool> {
-    let i = s.find("]11;rgb:")? + 8;
+    let (r, g, b) = parse_osc_rgb(s, "11")?;
+    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    Some(lum < 0.5)
+}
+
+/// Parse an `OSC <code> ; rgb:RRRR/GGGG/BBBB` colour reply into 0..1 components.
+fn parse_osc_rgb(s: &str, code: &str) -> Option<(f64, f64, f64)> {
+    let pat = format!("]{code};rgb:");
+    let i = s.find(&pat)? + pat.len();
     let rest = &s[i..];
     let parts: Vec<&str> = rest
         .split(|c: char| !c.is_ascii_hexdigit() && c != '/')
@@ -305,9 +319,7 @@ fn parse_bg(s: &str) -> Option<bool> {
         let max = (1u32 << (4 * p.len() as u32)) - 1;
         Some(v as f64 / max as f64)
     };
-    let (r, g, b) = (comp(parts[0])?, comp(parts[1])?, comp(parts[2])?);
-    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    Some(lum < 0.5)
+    Some((comp(parts[0])?, comp(parts[1])?, comp(parts[2])?))
 }
 
 fn parse_cell_size(s: &str) -> Option<(u32, u32)> {
@@ -353,5 +365,9 @@ mod tests {
         assert_eq!(parse_cell_size(s), Some((17, 36)));
         assert_eq!(parse_cpr_col(s), Some(3));
         assert_eq!(parse_bg("\x1b]11;rgb:ffff/ffff/ffff\x07"), Some(false));
+        assert_eq!(
+            parse_osc_rgb("\x1b]10;rgb:ffff/8080/0000\x1b\\", "10"),
+            Some((1.0, 128.0 / 255.0, 0.0))
+        );
     }
 }

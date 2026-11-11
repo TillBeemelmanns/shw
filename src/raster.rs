@@ -414,6 +414,54 @@ pub fn compose_row(items: &[Raster], gap: u32) -> Raster {
     Raster { w, h, ch: 4, data }
 }
 
+// ---------------------------------------------------------------------------
+// Typeset text (large headings)
+
+/// GitHub's font stack, restricted to families fontdb can resolve.
+const HEADING_FONTS: &str = "'Helvetica Neue', Helvetica, 'Segoe UI', 'Noto Sans', 'Liberation Sans', 'DejaVu Sans', Arial, sans-serif";
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn text_svg(text: &str, size: f64, w: f64, h: f64, baseline: f64, color: (u8, u8, u8)) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}"><text x="0" y="{baseline:.2}" font-family="{HEADING_FONTS}" font-weight="600" font-size="{size:.2}" fill="#{:02x}{:02x}{:02x}">{}</text></svg>"##,
+        color.0,
+        color.1,
+        color.2,
+        xml_escape(text)
+    )
+}
+
+/// Rendered width of `text` at `size` px (semibold), or None if no font is available.
+pub fn text_width(text: &str, size: f64) -> Option<f64> {
+    let svg = text_svg(text, size, 20000.0, size * 2.0, size * 1.5, (0, 0, 0));
+    let tree = parse_svg(svg.as_bytes(), None).ok()?;
+    let bb = tree.root().bounding_box();
+    (bb.width() > 0.0).then(|| bb.right() as f64)
+}
+
+/// Render one line of text into an RGBA raster exactly `h` px tall,
+/// vertically centred on the cap height.
+pub fn render_text_line(text: &str, size: f64, h: u32, color: (u8, u8, u8)) -> Option<Raster> {
+    let w = text_width(text, size)?.ceil() + 2.0;
+    let baseline = h as f64 / 2.0 + size * 0.36;
+    let svg = text_svg(text, size, w, h as f64, baseline, color);
+    let tree = parse_svg(svg.as_bytes(), None).ok()?;
+    Some(render_svg(&tree, (0.0, 0.0, w, h as f64), w as u32, h))
+}
+
+/// Load the system font database in the background so the first heading is fast.
+pub fn warm_fonts() {
+    std::thread::spawn(|| {
+        let _ = fontdb();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

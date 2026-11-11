@@ -37,6 +37,10 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 /// Allocate an image id. Ids stay below 2^24 so they can be encoded in a
 /// true-colour foreground for Unicode placeholders, and are randomised per
 /// process so inline images of earlier runs are not replaced.
+/// z-index that puts an image below cells with a non-default background, so
+/// status bars (which have a background colour) always cover it.
+pub const Z_BELOW_BG: &str = "z=-1073741825";
+
 pub fn next_id() -> u32 {
     let mut cur = NEXT_ID.load(Ordering::Relaxed);
     if cur == 0 {
@@ -232,11 +236,6 @@ impl Kitty {
     /// Delete an image and free its data.
     pub fn delete(&self, out: &mut Vec<u8>, id: u32) {
         self.cmd(out, &format!("a=d,d=I,i={id},q=2"));
-    }
-
-    /// Delete all visible placements but keep image data.
-    pub fn clear_placements(&self, out: &mut Vec<u8>) {
-        self.cmd(out, "a=d,d=a,q=2");
     }
 }
 

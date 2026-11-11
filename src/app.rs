@@ -20,6 +20,7 @@ pub struct Opts {
     pub lang: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Ctx {
     pub env: Env,
     pub caps: Caps,
@@ -27,6 +28,9 @@ pub struct Ctx {
     pub theme: Theme,
     pub opts: Opts,
 }
+
+/// Rows reserved at the bottom of interactive views: status line + key hints.
+pub const CHROME_ROWS: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nav {
@@ -45,9 +49,15 @@ impl Ctx {
             px_w: 0,
             px_h: 0,
         });
-        if ws.px_w == 0 || ws.px_h == 0 {
-            if let Some((cw, ch)) = self.caps.cell_px {
+        // Some terminals (e.g. Ghostty) include window padding in the pixel size,
+        // which overestimates the cell size. The terminal's own cell size report
+        // (CSI 16 t) is exact; take the smaller value, so a stale report after a
+        // font size change can only make images slightly smaller, never overlap.
+        if let Some((cw, ch)) = self.caps.cell_px {
+            if ws.px_w == 0 || cw * (ws.cols as u32) < ws.px_w {
                 ws.px_w = cw * ws.cols as u32;
+            }
+            if ws.px_h == 0 || ch * (ws.rows as u32) < ws.px_h {
                 ws.px_h = ch * ws.rows as u32;
             }
         }

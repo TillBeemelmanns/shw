@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, MouseButton, MouseEventKind};
 
-use crate::app::{is_quit, pos_label, read_events, Ctx, Nav};
+use crate::app::{is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS};
 use crate::fetch::which;
 use crate::kitty::{next_id, placeholder_row};
 use crate::raster::Raster;
 use crate::term::WinSize;
-use crate::ui::{fmt_duration, help_screen, truncate, Rgb, Style};
+use crate::ui::{fmt_duration, help_screen, hint_bar, truncate, Rgb, Style};
 
 #[derive(Clone, Debug)]
 pub struct Info {
@@ -189,7 +189,7 @@ struct Layout {
 fn compute_layout(info: &Info, view: View, ws: WinSize, max_px: f64) -> Layout {
     let (cw, ch) = ws.cell();
     let aw = ws.cols as f64 * cw;
-    let ah = ws.rows.saturating_sub(1).max(1) as f64 * ch;
+    let ah = ws.rows.saturating_sub(CHROME_ROWS).max(1) as f64 * ch;
     let (iw, ih) = (info.width as f64, info.height as f64);
     let fit = (aw / iw).min(ah / ih);
     let z = fit * view.zoom;
@@ -339,6 +339,20 @@ impl Clock {
     }
 }
 
+const HINTS: &[(&str, &str)] = &[
+    ("space", "play/pause"),
+    ("←/→", "±5s"),
+    ("↓/↑", "±30s"),
+    ("click", "seek"),
+    ("wheel/+-", "zoom"),
+    ("0", "reset"),
+    ("m", "mute"),
+    ("l", "loop"),
+    (".", "step"),
+    ("s", "snapshot"),
+    ("n/p", "next/prev"),
+];
+
 const HELP: &[(&str, &str)] = &[
     ("space / k", "play / pause"),
     ("← / →", "seek -5s / +5s"),
@@ -369,7 +383,7 @@ fn status(
 ) -> (String, (u16, u16)) {
     let th = &ctx.theme;
     let cols = ws.cols as usize;
-    let mut s = format!("\x1b[{};1H\x1b[0m\x1b[2K", ws.rows);
+    let mut s = format!("\x1b[{};1H\x1b[0m\x1b[2K", ws.rows - 1);
     let mut badge = String::new();
     Style {
         fg: Some(if th.dark {
@@ -459,6 +473,7 @@ fn status(
         s.push_str(&" ".repeat(cols - used));
     }
     s.push_str("\x1b[0m");
+    s.push_str(&hint_bar(th, ws.rows, ws.cols, HINTS));
     (s, (start_col as u16, (start_col + bar_w) as u16))
 }
 
@@ -607,7 +622,12 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                     k.transmit(
                         &mut out,
                         &raster,
-                        &format!("a=T,i={new_id},p=1,X={},Y={},C=1{size}", lay.xo, lay.yo),
+                        &format!(
+                            "a=T,i={new_id},p=1,X={},Y={},C=1{size},{}",
+                            lay.xo,
+                            lay.yo,
+                            crate::kitty::Z_BELOW_BG
+                        ),
                     );
                 }
                 if shown {
@@ -673,7 +693,10 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                     pending_restart = Some(Instant::now());
                 }
                 Event::Mouse(m) => {
-                    let (aw, ah) = (ws.cols as f64 * cw, ws.rows.saturating_sub(1) as f64 * ch);
+                    let (aw, ah) = (
+                        ws.cols as f64 * cw,
+                        ws.rows.saturating_sub(CHROME_ROWS) as f64 * ch,
+                    );
                     let fit = (aw / info.width as f64).min(ah / info.height as f64);
                     let z = fit * view.zoom;
                     let anchor = (
@@ -697,7 +720,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                             zoom_to(view.zoom / 1.25, &mut view);
                             pending_restart = Some(Instant::now() + Duration::from_millis(180));
                         }
-                        MouseEventKind::Down(MouseButton::Left) if m.row + 1 == ws.rows => {
+                        MouseEventKind::Down(MouseButton::Left) if m.row + 2 == ws.rows => {
                             if info.duration > 0.0
                                 && m.column >= bar_cols.0
                                 && m.column < bar_cols.1
