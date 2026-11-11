@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
 
-use crate::app::{is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS};
+use crate::app::{
+    is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS, MOUSE_TO_APP, MOUSE_TO_TERMINAL,
+};
 use crate::doc::{render_text, Doc, Row};
 use crate::kitty::placeholder_row;
 use crate::term::WinSize;
@@ -23,6 +25,7 @@ pub trait Source {
 const HELP: &[(&str, &str)] = &[
     ("j / k / ↓ / ↑", "scroll line"),
     ("wheel", "scroll"),
+    ("mouse drag", "select text (copy with ⌘C / Ctrl+Shift+C)"),
     ("space / b", "page down / up"),
     ("d / u", "half page down / up"),
     ("g / G", "top / bottom"),
@@ -71,6 +74,8 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
         ctx.theme = Theme::for_bg(dark, ctx.caps.dark);
     }
     let ctx = &mut ctx;
+    // Native text selection: the terminal handles the mouse in documents.
+    ctx.write(MOUSE_TO_TERMINAL);
     let mut ws = ctx.size();
     let mut doc = src.layout(ctx, ws);
     let mut st = State {
@@ -205,6 +210,7 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
     let mut out = Vec::new();
     free_images(ctx, &mut doc, &mut out);
     out.extend_from_slice(b"\x1b[0m\x1b[2J");
+    out.extend_from_slice(MOUSE_TO_APP);
     ctx.write(&out);
     Ok(nav)
 }

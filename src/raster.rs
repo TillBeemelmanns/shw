@@ -441,7 +441,7 @@ fn text_svg(text: &str, size: f64, w: f64, h: f64, baseline: f64, color: (u8, u8
 pub fn text_width(text: &str, size: f64) -> Option<f64> {
     let svg = text_svg(text, size, 20000.0, size * 2.0, size * 1.5, (0, 0, 0));
     let tree = parse_svg(svg.as_bytes(), None).ok()?;
-    let bb = tree.root().bounding_box();
+    let bb = tree.root().bounding_box()?;
     (bb.width() > 0.0).then(|| bb.right() as f64)
 }
 

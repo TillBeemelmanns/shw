@@ -98,7 +98,8 @@ impl Ctx {
 pub struct Screen;
 
 const ENTER: &str = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?7l";
-const LEAVE: &str = "\x1b[?7h\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
+const LEAVE: &str =
+    "\x1b[?7h\x1b[?1007l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
 impl Screen {
     pub fn enter() -> Result<Screen> {
@@ -125,6 +126,13 @@ impl Drop for Screen {
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
+
+/// Hand the mouse back to the terminal so text can be selected and copied
+/// natively; the wheel still scrolls because alternate-scroll mode (1007)
+/// turns it into arrow keys.
+pub const MOUSE_TO_TERMINAL: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1007h";
+/// Report mouse events (clicks, drags, wheel) to shw again.
+pub const MOUSE_TO_APP: &[u8] = b"\x1b[?1007l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
 pub fn is_quit(ev: &Event) -> bool {
     match ev {

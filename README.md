@@ -36,7 +36,8 @@ shw ~/Pictures         # browse a folder (n / p)
   - **inline images** (local files, remote URLs, SVG badges from shields.io), HTML `<img width=…>` and
     `<p align="center">`
   - mermaid diagrams, if [`mmdc`](https://github.com/mermaid-js/mermaid-cli) is installed
-  - search with `/`, `n`, `N`
+  - search with `/`, `n`, `N`; select text with the mouse to copy it (the terminal's native selection), and
+    click links
 - **Code / text** files with syntax highlighting and line numbers, and a hex view for binaries.
 - **Works everywhere kitty graphics work**: kitty, Ghostty, WezTerm and Konsole, **over ssh**, and inside **tmux**
   (Unicode placeholders + passthrough).
