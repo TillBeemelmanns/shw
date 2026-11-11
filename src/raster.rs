@@ -199,15 +199,81 @@ fn fontdb() -> Arc<resvg::usvg::fontdb::Database> {
     DB.get_or_init(|| {
         let mut db = resvg::usvg::fontdb::Database::new();
         db.load_system_fonts();
+        crate::app::trace(format!("system fonts loaded ({} faces)", db.len()));
         Arc::new(db)
     })
     .clone()
 }
 
+/// Font files sufficient for headings: one sans-serif family plus colour emoji.
+/// Loading these takes a few milliseconds, versus ~100 ms to index every
+/// system font (810 faces on a stock macOS).
+const HEADING_FONT_FILES: &[&str] = &[
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf",
+    "/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+    "/usr/share/fonts/google-noto-color-emoji-fonts/NotoColorEmoji.ttf",
+];
+
+/// Small font database for headings, or None if no known heading font exists.
+fn heading_fontdb() -> Option<Arc<resvg::usvg::fontdb::Database>> {
+    use std::sync::OnceLock;
+    static DB: OnceLock<Option<Arc<resvg::usvg::fontdb::Database>>> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        for f in HEADING_FONT_FILES {
+            if Path::new(f).exists() {
+                let _ = db.load_font_file(f);
+            }
+        }
+        crate::app::trace(format!("heading fonts loaded ({} faces)", db.len()));
+        (!db.is_empty()).then(|| Arc::new(db))
+    })
+    .clone()
+}
+
+/// Characters the heading fonts cover: Latin, punctuation, symbols and emoji.
+/// Anything else (CJK, Arabic, …) needs the full system font index.
+fn heading_fonts_cover(text: &str) -> bool {
+    text.chars().all(|c| {
+        c <= '\u{024F}'
+            || ('\u{2000}'..='\u{2BFF}').contains(&c)
+            || c >= '\u{1F000}'
+            || matches!(c, '\u{FE0F}' | '\u{200D}' | '\u{20E3}')
+    })
+}
+
+fn heading_db_for(text: &str) -> Arc<resvg::usvg::fontdb::Database> {
+    match heading_fontdb() {
+        Some(db) if heading_fonts_cover(text) => db,
+        _ => fontdb(),
+    }
+}
+
 pub fn parse_svg(data: &[u8], resources_dir: Option<&Path>) -> Result<resvg::usvg::Tree> {
+    parse_svg_with(data, resources_dir, fontdb())
+}
+
+fn parse_svg_with(
+    data: &[u8],
+    resources_dir: Option<&Path>,
+    fontdb: Arc<resvg::usvg::fontdb::Database>,
+) -> Result<resvg::usvg::Tree> {
     let opt = resvg::usvg::Options {
         resources_dir: resources_dir.map(|p| p.to_path_buf()),
-        fontdb: fontdb(),
+        fontdb,
         ..Default::default()
     };
     resvg::usvg::Tree::from_data(data, &opt).map_err(|e| anyhow!("invalid SVG: {e}"))
@@ -443,7 +509,7 @@ fn text_svg(text: &str, size: f64, w: f64, h: f64, baseline: f64, color: (u8, u8
 /// Rendered width of `text` at `size` px (semibold), or None if no font is available.
 pub fn text_width(text: &str, size: f64) -> Option<f64> {
     let svg = text_svg(text, size, 20000.0, size * 2.0, size * 1.5, (0, 0, 0));
-    let tree = parse_svg(svg.as_bytes(), None).ok()?;
+    let tree = parse_svg_with(svg.as_bytes(), None, heading_db_for(text)).ok()?;
     let bb = tree.root().bounding_box()?;
     (bb.width() > 0.0).then(|| bb.right() as f64)
 }
@@ -454,7 +520,7 @@ pub fn render_text_line(text: &str, size: f64, h: u32, color: (u8, u8, u8)) -> O
     let w = text_width(text, size)?.ceil() + 2.0;
     let baseline = h as f64 / 2.0 + size * 0.36;
     let svg = text_svg(text, size, w, h as f64, baseline, color);
-    let tree = parse_svg(svg.as_bytes(), None).ok()?;
+    let tree = parse_svg_with(svg.as_bytes(), None, heading_db_for(text)).ok()?;
     Some(render_svg(&tree, (0.0, 0.0, w, h as f64), w as u32, h))
 }
 
@@ -501,7 +567,9 @@ pub fn checkbox(
     let svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{shape}</svg>"#
     );
-    match parse_svg(svg.as_bytes(), None) {
+    // no text in the icon: skip loading system fonts
+    let no_fonts = Arc::new(resvg::usvg::fontdb::Database::new());
+    match parse_svg_with(svg.as_bytes(), None, no_fonts) {
         Ok(tree) => render_svg(&tree, (0.0, 0.0, w as f64, h as f64), w, h),
         Err(_) => Raster {
             w,
@@ -522,6 +590,12 @@ pub fn warm_fonts() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heading_font_coverage() {
+        assert!(heading_fonts_cover("Roadmap — v1.0 🚀 ✓ Ünïcödé"));
+        assert!(!heading_fonts_cover("路线图"));
+    }
 
     #[test]
     fn resize_and_rotate() {

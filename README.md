@@ -191,6 +191,9 @@ cargo clippy --all-targets -- -D warnings
 cargo run -- README.md
 ```
 
+Startup timing: `SHW_TRACE=1 shw README.md` prints how long each phase took (terminal query,
+fonts, images, layout, first frame) after you quit.
+
 ### Releasing
 
 1. Bump `version` in `Cargo.toml` and run `cargo check` to update `Cargo.lock`.

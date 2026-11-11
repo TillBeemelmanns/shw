@@ -176,15 +176,31 @@ impl Drop for RawGuard {
     }
 }
 
+/// Wait until `fd` is readable. Uses select(): on macOS poll() does not work
+/// on terminal devices (it returns POLLNVAL immediately), which would turn
+/// every timeout into a blocking read.
 fn poll_read(fd: i32, timeout: Duration) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
+    if fd < 0 || fd >= libc::FD_SETSIZE as i32 {
+        return false;
+    }
+    let mut tv = libc::timeval {
+        tv_sec: timeout.as_secs().min(3600) as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
     };
-    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: single pollfd on the stack.
-    unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+    // SAFETY: fd_set on the stack, initialised by FD_ZERO; fd < FD_SETSIZE.
+    unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
+        libc::select(
+            fd + 1,
+            &mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut tv,
+        ) > 0
+            && libc::FD_ISSET(fd, &set)
+    }
 }
 
 /// Query the terminal for kitty graphics support, transfer modes, background

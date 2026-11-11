@@ -1,6 +1,8 @@
 //! Shared application context and interactive screen handling.
 
 use std::io::Write;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -173,5 +175,47 @@ pub fn pos_label(pos: (usize, usize)) -> String {
         format!("  [{}/{}]", pos.0 + 1, pos.1)
     } else {
         String::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup timing trace: `SHW_TRACE=1 shw file` prints phase timings on exit.
+
+struct Trace {
+    start: Instant,
+    marks: Mutex<Vec<(f64, String)>>,
+}
+
+fn tracer() -> Option<&'static Trace> {
+    static T: OnceLock<Option<Trace>> = OnceLock::new();
+    T.get_or_init(|| {
+        std::env::var_os("SHW_TRACE").map(|_| Trace {
+            start: Instant::now(),
+            marks: Mutex::new(Vec::new()),
+        })
+    })
+    .as_ref()
+}
+
+/// Record a timing mark (no-op unless SHW_TRACE is set).
+pub fn trace(label: impl Into<String>) {
+    if let Some(t) = tracer() {
+        let ms = t.start.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(mut m) = t.marks.lock() {
+            m.push((ms, label.into()));
+        }
+    }
+}
+
+/// Print the collected marks to stderr (call after leaving the alternate screen).
+pub fn print_trace() {
+    if let Some(t) = tracer() {
+        if let Ok(m) = t.marks.lock() {
+            let mut prev = 0.0;
+            for (ms, label) in m.iter() {
+                eprintln!("shw trace {ms:8.1} ms  (+{:7.1})  {label}", ms - prev);
+                prev = *ms;
+            }
+        }
     }
 }

@@ -71,14 +71,22 @@ impl Markdown {
 
     pub fn layout(&mut self, o: &LayoutOpts) -> Doc {
         let events: Vec<Event> = Parser::new_ext(&self.src, Self::options()).collect();
+        crate::app::trace("markdown parsed");
         if o.graphics {
             preload(&events, &self.base, &mut self.cache, o);
+            crate::app::trace("images loaded");
         }
         let mut r = Renderer::new(o, &self.cache, &self.base);
         for ev in events {
             r.event(ev);
         }
-        r.finish()
+        let doc = r.finish();
+        crate::app::trace(format!(
+            "markdown laid out ({} rows, {} images)",
+            doc.rows.len(),
+            doc.images.len()
+        ));
+        doc
     }
 }
 

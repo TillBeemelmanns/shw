@@ -78,6 +78,7 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
     ctx.write(MOUSE_TO_TERMINAL);
     let mut ws = ctx.size();
     let mut doc = src.layout(ctx, ws);
+    let mut first_draw = true;
     let mut st = State {
         top: 0,
         search: None,
@@ -92,6 +93,9 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
         st.top = st.top.min(max_top);
         if dirty {
             draw(ctx, &mut doc, &st, ws, src, pos);
+            if std::mem::take(&mut first_draw) {
+                crate::app::trace("first frame drawn");
+            }
             dirty = false;
         }
         let evs = read_events(Duration::from_secs(3600))?;

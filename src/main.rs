@@ -201,6 +201,7 @@ fn load_picture(item: &Item) -> Result<Picture> {
 }
 
 fn run() -> Result<()> {
+    app::trace("start");
     let cli = Cli::parse();
     if let Some(shell) = cli.completions {
         clap_complete::generate(shell, &mut Cli::command(), "shw", &mut std::io::stdout());
@@ -231,18 +232,20 @@ fn run() -> Result<()> {
     let interactive = !cli.inline && tty_out && !cli.doctor;
     let can_probe = (tty_out || cli.doctor) && env.fzf.is_none() && !cli.force;
 
+    app::trace("inputs collected");
     let screen = if interactive {
         Some(Screen::enter()?)
     } else {
         None
     };
+    app::trace("screen entered");
     let mut caps = if can_probe {
         term::probe(
             &env,
             if env.ssh {
                 Duration::from_millis(2500)
             } else {
-                Duration::from_millis(1000)
+                Duration::from_millis(500)
             },
         )
     } else {
@@ -251,6 +254,10 @@ fn run() -> Result<()> {
             ..Default::default()
         }
     };
+    app::trace(format!(
+        "terminal probed (answered: {}, graphics: {}, file: {}, shm: {}, cell: {:?})",
+        caps.responded, caps.graphics, caps.file_transfer, caps.shm_transfer, caps.cell_px
+    ));
     if cli.force {
         caps.graphics = true;
     }
@@ -314,13 +321,15 @@ fn run() -> Result<()> {
         );
     }
 
-    if interactive {
+    let r = if interactive {
         let r = run_interactive(&ctx, &items);
         drop(screen);
         r
     } else {
         run_inline(&ctx, &items, cli.upscale)
-    }
+    };
+    app::print_trace();
+    r
 }
 
 // ---------------------------------------------------------------------------
