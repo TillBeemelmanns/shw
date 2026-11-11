@@ -35,6 +35,27 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading shw ${TAG} from $URL ..."
 curl -fsSL "$URL" -o "$TMPDIR/shw.tar.gz"
+
+# Verify the archive against the checksum published with the release.
+curl -fsSL "${URL}.sha256" -o "$TMPDIR/shw.tar.gz.sha256"
+EXPECTED=$(awk '{print $1}' "$TMPDIR/shw.tar.gz.sha256")
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TMPDIR/shw.tar.gz" | awk '{print $1}')
+else
+    ACTUAL=$(shasum -a 256 "$TMPDIR/shw.tar.gz" | awk '{print $1}')
+fi
+if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+    echo "Checksum mismatch for ${TARGET}.tar.gz (expected ${EXPECTED:-none}, got ${ACTUAL})" >&2
+    exit 1
+fi
+echo "Checksum OK (sha256 ${ACTUAL})"
+
+# Optional: verify the signed build provenance when the GitHub CLI is available.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    gh attestation verify "$TMPDIR/shw.tar.gz" --repo "$REPO" >/dev/null \
+        && echo "Build provenance verified (built by ${REPO} GitHub Actions)"
+fi
+
 tar -xzf "$TMPDIR/shw.tar.gz" -C "$TMPDIR"
 
 mkdir -p "$DEST"

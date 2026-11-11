@@ -1,5 +1,6 @@
 //! Colours, styled text spans and status bar rendering.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -187,6 +188,28 @@ pub fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.width()).sum()
 }
 
+fn is_control(c: char) -> bool {
+    c.is_control() // C0, DEL and C1 (U+0080..U+009F)
+}
+
+/// Make untrusted text safe to print: control characters (ESC, BEL, C1, …)
+/// could otherwise inject terminal escape sequences, e.g. OSC 52 to
+/// overwrite the clipboard. Tabs become spaces, everything else `�`.
+pub fn sanitize(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(is_control) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| match c {
+                '\t' => ' ',
+                c if is_control(c) => '\u{FFFD}',
+                c => c,
+            })
+            .collect(),
+    )
+}
+
 /// Write spans as ANSI text. `scale` > 1 uses the kitty text sizing protocol.
 pub fn write_spans(
     out: &mut String,
@@ -205,7 +228,12 @@ pub fn write_spans(
     };
     let mut cur_link: Option<&str> = None;
     for s in spans {
-        let link = s.style.link.as_deref();
+        // A URL with control characters could break out of the OSC 8 sequence: drop it.
+        let link = s
+            .style
+            .link
+            .as_deref()
+            .filter(|u| !u.chars().any(is_control));
         if link != cur_link {
             match link {
                 Some(url) => out.push_str(&format!("\x1b]8;;{url}\x1b\\")),
@@ -225,7 +253,7 @@ pub fn write_spans(
         if scale > 1 {
             // OSC 66 payloads are limited to 4096 bytes; split long spans.
             let mut buf = String::new();
-            for ch in s.text.chars() {
+            for ch in sanitize(&s.text).chars() {
                 buf.push(ch);
                 if buf.len() > 3000 {
                     out.push_str(&format!("\x1b]66;s={scale};{buf}\x07"));
@@ -236,7 +264,7 @@ pub fn write_spans(
                 out.push_str(&format!("\x1b]66;s={scale};{buf}\x07"));
             }
         } else {
-            out.push_str(&s.text);
+            out.push_str(&sanitize(&s.text));
         }
     }
     if cur_link.is_some() {
@@ -292,6 +320,7 @@ fn highlight_spans(spans: &[Span], q: &str, bg: Rgb) -> Vec<Span> {
 
 /// Truncate a string to `max` display columns, adding an ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
+    let s = &*sanitize(s);
     if s.width() <= max {
         return s.to_string();
     }
@@ -322,6 +351,7 @@ pub fn status_bar(
     let mut s = format!("\x1b[{row};1H\x1b[0m\x1b[2K");
     let badge_txt = format!(" {badge} ");
     let bw = badge_txt.width();
+    let right = &*sanitize(right);
     let rw = right.width();
     let avail = cols.saturating_sub(bw + rw + 3);
     let left = truncate(left, avail);
@@ -499,6 +529,24 @@ pub fn fmt_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_escape_sequences() {
+        assert_eq!(
+            sanitize("a\x1b]52;c;eA==\x07b"),
+            "a\u{FFFD}]52;c;eA==\u{FFFD}b"
+        );
+        assert_eq!(sanitize("tab\there\u{9b}x"), "tab here\u{FFFD}x");
+        assert!(matches!(sanitize("plain ✓"), Cow::Borrowed(_)));
+        let mut out = String::new();
+        let evil = Style {
+            link: Some("https://x/\x1b]52;c;eA==\x07".into()),
+            ..Default::default()
+        };
+        write_spans(&mut out, &[Span::new("hi\x1b[2J", evil)], 1, None, None);
+        assert!(!out.contains("]52;"), "{out:?}");
+        assert!(!out.contains("\x1b[2J"));
+    }
 
     #[test]
     fn highlight_splits() {

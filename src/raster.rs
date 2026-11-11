@@ -361,7 +361,10 @@ fn decode_with_ffmpeg_bytes(path: &str) -> Result<Picture> {
     if path.is_empty() || path == "-" {
         return Err(anyhow!("unsupported image format"));
     }
-    let out = std::process::Command::new("ffmpeg")
+    let ffmpeg = crate::fetch::tool("ffmpeg").ok_or_else(|| {
+        anyhow!("unsupported image format (install ffmpeg for HEIC/AVIF/JXL support)")
+    })?;
+    let out = std::process::Command::new(ffmpeg)
         .args([
             "-v",
             "error",

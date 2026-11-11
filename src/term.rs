@@ -210,7 +210,7 @@ pub fn probe(env: &Env, timeout: Duration) -> Caps {
     // shares our filesystem (not over ssh, not through tmux).
     let local = !env.ssh && !env.tmux;
     let tmp_path = kitty::temp_path("probe");
-    let file_probe = local && std::fs::write(&tmp_path, [0u8; 3]).is_ok();
+    let file_probe = local && kitty::write_private_new(&tmp_path, &[0u8; 3]).is_ok();
     if file_probe {
         q += &format!(
             "\x1b_Gi=4000002,s=1,v=1,a=q,t=t,f=24;{}\x1b\\",

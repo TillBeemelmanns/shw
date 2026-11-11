@@ -128,22 +128,49 @@ fn resolve(base: &Base, src: &str) -> Option<String> {
     }
 }
 
+/// Local files a link may point at: ones the OS opens in a viewer or editor.
+/// Anything else (scripts, `.command`, apps, …) could execute when clicked.
+const SAFE_LINK_EXT: &[&str] = &[
+    "md", "markdown", "mdown", "mkd", "txt", "rst", "adoc", "png", "jpg", "jpeg", "gif", "webp",
+    "svg", "bmp", "pdf",
+];
+
+/// Target for a clickable (OSC 8) link, or None if it should not be clickable.
+/// Only http(s) and mailto URLs and harmless local file types are allowed;
+/// other schemes (`javascript:`, custom app schemes, `file:` to scripts) are dropped.
 fn link_target(base: &Base, url: &str) -> Option<Rc<str>> {
-    if url.starts_with('#') || url.is_empty() {
+    let url = url.trim();
+    if url.starts_with('#') || url.is_empty() || url.chars().any(char::is_control) {
         return None;
     }
-    if fetch::is_url(url) || url.contains("://") || url.starts_with("mailto:") {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
+    {
         return Some(url.into());
+    }
+    let has_scheme = url.split_once(':').is_some_and(|(s, _)| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    if has_scheme && !lower.starts_with("file:") {
+        return None;
     }
     let r = resolve(base, url)?;
     if fetch::is_url(&r) {
-        Some(r.into())
-    } else {
-        let abs = std::fs::canonicalize(&r)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or(r);
-        Some(format!("file://{abs}").into())
+        return Some(r.into());
     }
+    let ext = Path::new(&r)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !SAFE_LINK_EXT.contains(&ext.as_str()) {
+        return None;
+    }
+    let abs = std::fs::canonicalize(&r)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(r);
+    Some(format!("file://{abs}").into())
 }
 
 fn mermaid_key(src: &str) -> String {
@@ -154,12 +181,24 @@ fn mermaid_key(src: &str) -> String {
 }
 
 fn render_mermaid(src: &str, dark: bool) -> Option<Picture> {
-    let dir = std::env::temp_dir();
-    let id = format!("{}-{}", std::process::id(), crate::kitty::next_id());
-    let input = dir.join(format!("shw-mermaid-{id}.mmd"));
-    let output = dir.join(format!("shw-mermaid-{id}.png"));
-    std::fs::write(&input, src).ok()?;
-    let status = std::process::Command::new("mmdc")
+    use std::os::unix::fs::DirBuilderExt;
+    let mmdc = fetch::tool("mmdc")?;
+    // private, unpredictable working directory, always removed afterwards
+    let dir = std::env::temp_dir().join(format!("shw-mermaid-{}", crate::kitty::random_hex(12)));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+    let result = render_mermaid_in(&mmdc, &dir, src, dark);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn render_mermaid_in(mmdc: &Path, dir: &Path, src: &str, dark: bool) -> Option<Picture> {
+    let input = dir.join("diagram.mmd");
+    let output = dir.join("diagram.png");
+    crate::kitty::write_private_new(&input, src.as_bytes()).ok()?;
+    // Run inside the private directory: Puppeteer (used by mmdc) loads config
+    // files such as .puppeteerrc.cjs from the working directory.
+    let status = std::process::Command::new(mmdc)
+        .current_dir(dir)
         .arg("-i")
         .arg(&input)
         .arg("-o")
@@ -177,9 +216,7 @@ fn render_mermaid(src: &str, dark: bool) -> Option<Picture> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    let _ = std::fs::remove_file(&input);
     let data = std::fs::read(&output).ok();
-    let _ = std::fs::remove_file(&output);
     if !status.ok()?.success() {
         return None;
     }
@@ -253,7 +290,12 @@ fn preload(events: &[Event], base: &Base, cache: &mut Cache, o: &LayoutOpts) {
                 chunk
                     .iter()
                     .map(|k| {
-                        let pic = fetch::read_source(k).ok().and_then(|data| {
+                        let data = if fetch::is_url(k) {
+                            fetch::fetch_untrusted(k)
+                        } else {
+                            fetch::read_source(k)
+                        };
+                        let pic = data.ok().and_then(|data| {
                             let dir = Path::new(k).parent().filter(|_| !fetch::is_url(k));
                             crate::raster::decode(data, k, dir).ok()
                         });
@@ -1614,6 +1656,27 @@ mod tests {
         let w = fit_columns(&[3, 100], 40);
         assert_eq!(w[0], 3);
         assert_eq!(w[1], 37);
+    }
+
+    #[test]
+    fn link_allowlist() {
+        let b = Base::Dir("/repo".into());
+        assert!(link_target(&b, "https://example.com").is_some());
+        assert!(link_target(&b, "mailto:a@b.c").is_some());
+        assert_eq!(
+            link_target(&b, "docs/guide.md").as_deref(),
+            Some("file:///repo/docs/guide.md")
+        );
+        for bad in [
+            "./setup.command",
+            "run.sh",
+            "javascript:alert(1)",
+            "vscode://x",
+            "file:///Applications/X.app",
+            "https://x/\x1b]52;c;x\x07",
+        ] {
+            assert!(link_target(&b, bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

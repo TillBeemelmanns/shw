@@ -61,21 +61,55 @@ pub fn next_id() -> u32 {
     id
 }
 
+/// Unpredictable hex token for temp file / shm names.
+pub fn random_hex(bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !ok {
+        // fallback: time, pid and a counter mixed together
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut x = t
+            ^ ((std::process::id() as u128) << 64)
+            ^ COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        for b in buf.iter_mut() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 64) as u8;
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn temp_path(tag: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     // The name must contain "tty-graphics-protocol" so terminals agree to delete it.
     std::env::temp_dir().join(format!(
-        "shw-tty-graphics-protocol-{}-{}-{}",
-        std::process::id(),
-        tag,
-        n
+        "shw-tty-graphics-protocol-{tag}-{}",
+        random_hex(12)
     ))
 }
 
+/// Create a new file readable only by the user. Fails if anything (including a
+/// symlink planted by another user) already exists at `path`.
+pub fn write_private_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
+}
+
 pub fn shm_name() -> String {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     // macOS limits POSIX shm names to 31 characters.
-    format!("/shw{}-{}", std::process::id() % 100000, n % 100000)
+    format!("/shw-{}", random_hex(10))
 }
 
 pub fn shm_write(name: &str, data: &[u8]) -> std::io::Result<()> {
@@ -189,7 +223,7 @@ impl Kitty {
             }
             Transfer::File => {
                 let path = temp_path("img");
-                if std::fs::write(&path, &img.data).is_ok() {
+                if write_private_new(&path, &img.data).is_ok() {
                     let ctrl = format!("{base},t=t");
                     let p = b64.encode(path.to_string_lossy().as_bytes());
                     self.push(out, &format!("\x1b_G{ctrl};{p}\x1b\\"));

@@ -177,6 +177,12 @@ or dark theme), the cell size in pixels and text-sizing support. Every frame is 
 pixels the terminal will show, so the terminal never rescales the image. Updates are wrapped in synchronized-output
 mode and swap between two image ids, so they don't flicker.
 
+## Security
+
+shw is designed to be safe on untrusted files: no terminal escape injection, no script execution,
+only safe links are clickable, and remote images only come from public hosts (`--offline` disables
+downloads). Release archives ship with checksums and signed build provenance. See [SECURITY.md](SECURITY.md).
+
 ## Development
 
 ```sh

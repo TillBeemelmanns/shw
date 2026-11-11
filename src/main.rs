@@ -80,7 +80,7 @@ impl Item {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("\x1b[1;31mshw:\x1b[0m {e:#}");
+        eprintln!("\x1b[1;31mshw:\x1b[0m {}", ui::sanitize(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
@@ -601,7 +601,7 @@ fn run_inline(ctx: &Ctx, items: &[Item], upscale: bool) -> Result<()> {
                 ..Default::default()
             }
             .sgr(&mut h);
-            println!("{h}── {} ──\x1b[0m", item.name);
+            println!("{h}── {} ──\x1b[0m", ui::sanitize(&item.name));
         }
         let ws = ctx.inline_size();
         let r: Result<()> = (|| {
@@ -647,7 +647,10 @@ fn run_inline(ctx: &Ctx, items: &[Item], upscale: bool) -> Result<()> {
             Ok(())
         })();
         if let Err(e) = r {
-            eprintln!("\x1b[1;31mshw:\x1b[0m {}: {e:#}", item.name);
+            eprintln!(
+                "\x1b[1;31mshw:\x1b[0m {}",
+                ui::sanitize(&format!("{}: {e:#}", item.name))
+            );
             first_err.get_or_insert(e);
         }
     }

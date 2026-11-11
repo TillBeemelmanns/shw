@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, MouseButton, MouseEventKind};
 
 use crate::app::{is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS};
-use crate::fetch::which;
+use crate::fetch::{tool, which};
 use crate::kitty::{next_id, placeholder_row};
 use crate::raster::Raster;
 use crate::term::WinSize;
@@ -29,7 +29,7 @@ pub struct Info {
 }
 
 pub fn probe(path: &str) -> Result<Info> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(tool("ffprobe").ok_or_else(|| anyhow!("ffprobe not found — install ffmpeg to play videos"))?)
         .args([
             "-v",
             "error",
@@ -107,30 +107,33 @@ pub fn probe(path: &str) -> Result<Info> {
 
 /// Grab a single frame at `at` seconds, scaled to `w` x `h`.
 pub fn thumbnail(path: &str, at: f64, w: u32, h: u32) -> Result<Raster> {
-    let out = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-ss",
-            &format!("{at:.3}"),
-            "-i",
-            path,
-        ])
-        .args([
-            "-frames:v",
-            "1",
-            "-an",
-            "-sn",
-            "-vf",
-            &format!("scale={w}:{h}:flags=lanczos"),
-        ])
-        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| anyhow!("ffmpeg not found — install ffmpeg to preview videos"))?;
+    let out = Command::new(
+        tool("ffmpeg")
+            .ok_or_else(|| anyhow!("ffmpeg not found — install ffmpeg to play videos"))?,
+    )
+    .args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-ss",
+        &format!("{at:.3}"),
+        "-i",
+        path,
+    ])
+    .args([
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-vf",
+        &format!("scale={w}:{h}:flags=lanczos"),
+    ])
+    .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+    .stdin(Stdio::null())
+    .stderr(Stdio::null())
+    .output()
+    .map_err(|_| anyhow!("ffmpeg not found — install ffmpeg to preview videos"))?;
     let need = (w * h * 3) as usize;
     if out.stdout.len() < need {
         if at > 0.0 {
@@ -254,24 +257,27 @@ fn spawn_pipeline(
     } else {
         info.fps
     };
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-threads",
-            "0",
-        ])
-        .args(["-ss", &format!("{:.3}", at.max(0.0)), "-i", path])
-        .args([
-            "-an", "-sn", "-dn", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| anyhow!("ffmpeg not found — install ffmpeg to play videos"))?;
+    let mut child = Command::new(
+        tool("ffmpeg")
+            .ok_or_else(|| anyhow!("ffmpeg not found — install ffmpeg to play videos"))?,
+    )
+    .args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-threads",
+        "0",
+    ])
+    .args(["-ss", &format!("{:.3}", at.max(0.0)), "-i", path])
+    .args([
+        "-an", "-sn", "-dn", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|_| anyhow!("ffmpeg not found — install ffmpeg to play videos"))?;
     let mut stdout = child
         .stdout
         .take()
@@ -300,7 +306,7 @@ fn spawn_pipeline(
 }
 
 fn spawn_audio(path: &str, at: f64) -> Option<Child> {
-    Command::new("ffplay")
+    Command::new(tool("ffplay")?)
         .args([
             "-nodisp",
             "-autoexit",
