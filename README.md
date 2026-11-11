@@ -188,8 +188,7 @@ cargo run -- README.md
 1. Bump `version` in `Cargo.toml` and run `cargo check` to update `Cargo.lock`.
 2. Commit and tag: `git commit -am "release v0.2.0" && git tag v0.2.0 && git push --follow-tags`.
 3. The [release workflow](.github/workflows/release.yml) builds binaries for all targets, creates the GitHub release with
-   checksums and completions, and publishes to crates.io. It needs a `CARGO_REGISTRY_TOKEN` repository secret
-   (in a `crates-io` environment).
+   checksums and completions, and publishes to crates.io. It needs a `CARGO_REGISTRY_TOKEN` repository secret.
 
 ## License
 
