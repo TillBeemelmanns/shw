@@ -59,6 +59,11 @@ fn fence_lang(info: &str) -> &str {
 }
 
 impl Markdown {
+    /// Replace the text (after the file was edited), keeping loaded pictures.
+    pub fn set_source(&mut self, src: String) {
+        self.src = src;
+    }
+
     pub fn new(src: String, base: Base) -> Self {
         Markdown {
             src,

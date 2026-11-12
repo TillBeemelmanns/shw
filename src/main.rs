@@ -344,6 +344,8 @@ fn run() -> Result<()> {
 struct MdSource {
     md: Markdown,
     title: String,
+    /// Local file (editable with `e`); None for stdin and URLs.
+    path: Option<PathBuf>,
 }
 
 /// `wait`: block until downloads have finished (non-interactive output).
@@ -397,6 +399,17 @@ impl Source for MdSource {
     }
     fn title(&self) -> String {
         self.title.clone()
+    }
+    fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+    fn reload(&mut self) -> Result<()> {
+        if let Some(p) = &self.path {
+            let data = std::fs::read(p).with_context(|| format!("cannot read {}", p.display()))?;
+            self.md
+                .set_source(String::from_utf8_lossy(&data).into_owned());
+        }
+        Ok(())
     }
 }
 
@@ -480,6 +493,8 @@ fn source_for(ctx: &Ctx, item: &Item) -> Result<Box<dyn Source>> {
         Kind::Markdown => Box::new(MdSource {
             md: Markdown::new(String::from_utf8_lossy(&data).into_owned(), item.base()),
             title: item.name.clone(),
+            path: (item.src != "-" && !fetch::is_url(&item.src))
+                .then(|| PathBuf::from(item.src.strip_prefix("file://").unwrap_or(&item.src))),
         }),
         Kind::Code => Box::new(CodeSource {
             text: String::from_utf8_lossy(&data).into_owned(),

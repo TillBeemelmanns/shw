@@ -29,6 +29,14 @@ pub trait Source {
     }
     fn badge(&self) -> &str;
     fn title(&self) -> String;
+    /// The local file behind the document, if it can be edited with `e`.
+    fn path(&self) -> Option<&std::path::Path> {
+        None
+    }
+    /// Read the file again after it was edited.
+    fn reload(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -41,6 +49,7 @@ const HELP: &[(&str, &str)] = &[
     ("/", "search"),
     ("n / N", "next / previous match"),
     ("t", "toggle dark / bright theme"),
+    ("e", "edit in $VISUAL / $EDITOR (markdown files)"),
     ("Tab / S-Tab", "next / previous file"),
     ("q / Esc", "quit"),
 ];
@@ -55,6 +64,7 @@ const HINTS: &[(&str, &str)] = &[
     ("t", "theme"),
     ("Tab", "next file"),
 ];
+const EDIT_HINT: (&str, &str) = ("e", "edit");
 
 /// Free every image the terminal holds for this document. Image data is
 /// always re-sent when it becomes visible again, so nothing relies on the
@@ -271,6 +281,11 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
                                 "bright theme".into()
                             });
                         }
+                        KeyCode::Char('e') => {
+                            st.message = Some(edit(ctx, src, &mut doc, &mut st));
+                            ws = ctx.size();
+                            relayout(ctx, src, &mut doc, &mut st, ws);
+                        }
                         KeyCode::Tab | KeyCode::Char(']') => {
                             nav = Some(Nav::Next);
                             break;
@@ -295,6 +310,33 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
     out.extend_from_slice(MOUSE_TO_APP);
     ctx.write(&out);
     Ok(nav)
+}
+
+/// Open the document's file in the user's editor and reload it afterwards.
+/// Returns the message for the status line.
+fn edit(ctx: &Ctx, src: &mut dyn Source, doc: &mut Doc, st: &mut State) -> String {
+    let Some(path) = src.path().map(|p| p.to_path_buf()) else {
+        return "only local files can be edited".into();
+    };
+    // Free the images first: the editor usually takes the alternate screen
+    // too, and the pictures would stay on top of it.
+    let mut out = std::mem::take(&mut st.stale);
+    free_images(ctx, doc, &mut out);
+    out.extend_from_slice(b"\x1b[0m\x1b[2J");
+    out.extend_from_slice(MOUSE_TO_APP);
+    ctx.write(&out);
+    let result = crate::app::edit_file(&path);
+    // Entering the screen again turned app mouse mode on; documents leave
+    // the mouse to the terminal (native selection).
+    ctx.write(MOUSE_TO_TERMINAL);
+    match result {
+        Ok(status) if status.success() => match src.reload() {
+            Ok(()) => "reloaded".into(),
+            Err(e) => format!("cannot reload: {e:#}"),
+        },
+        Ok(status) => format!("{} exited with {status}", crate::app::editor()),
+        Err(e) => format!("cannot start {}: {e:#}", crate::app::editor()),
+    }
 }
 
 fn find(doc: &Doc, st: &mut State, forward: bool, include_current: bool) {
@@ -450,7 +492,11 @@ fn draw(
     out.extend_from_slice(
         status_bar(t, ws.rows - 1, ws.cols, src.badge(), &left, &right).as_bytes(),
     );
-    out.extend_from_slice(hint_bar(t, ws.rows, ws.cols, HINTS).as_bytes());
+    let mut hints: Vec<(&str, &str)> = HINTS.to_vec();
+    if src.path().is_some() {
+        hints.insert(hints.len() - 1, EDIT_HINT);
+    }
+    out.extend_from_slice(hint_bar(t, ws.rows, ws.cols, &hints).as_bytes());
     out.extend_from_slice(b"\x1b[?2026l");
     ctx.write(&out);
 }

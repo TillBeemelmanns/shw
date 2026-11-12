@@ -157,6 +157,45 @@ impl Drop for Screen {
     }
 }
 
+/// The user's editor: `$VISUAL`, then `$EDITOR`, then `vi`.
+pub fn editor() -> String {
+    ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "vi".into())
+}
+
+/// Leave the full-screen mode, run the user's editor on `path` and wait for
+/// it, then restore the screen. The editor value may contain arguments (e.g.
+/// `code -w`), so it runs through `sh`; the path is passed as a separate
+/// argument, never spliced into the command line.
+pub fn edit_file(path: &std::path::Path) -> Result<std::process::ExitStatus> {
+    let editor = editor();
+    {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(LEAVE.as_bytes());
+        let _ = out.flush();
+    }
+    let _ = crossterm::terminal::disable_raw_mode();
+    SCREEN_ACTIVE.store(false, Ordering::Relaxed);
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status();
+    crossterm::terminal::enable_raw_mode()?;
+    SCREEN_ACTIVE.store(true, Ordering::Relaxed);
+    {
+        let mut out = std::io::stdout().lock();
+        out.write_all(ENTER.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(status?)
+}
+
 /// Hand the mouse back to the terminal so text can be selected and copied
 /// natively; the wheel still scrolls because alternate-scroll mode (1007)
 /// turns it into arrow keys.

@@ -43,6 +43,8 @@ shw ~/Pictures         # browse a folder (n / p)
     arrive
   - search with `/`, `n`, `N`; select text with the mouse to copy it (the terminal's native selection), and
     click links
+  - press `e` to edit the file in your `$VISUAL` / `$EDITOR` (falls back to `vi`); the document reloads
+    when the editor closes and keeps your reading position
 - **Code / text** files with syntax highlighting and line numbers, and a hex view for binaries.
 - **Works everywhere kitty graphics work**: kitty, Ghostty, WezTerm and Konsole, **over ssh**, and inside **tmux**.
 - **Optimized for ssh + tmux**: zooming and panning images on a remote machine inside tmux stays as responsive as
@@ -122,7 +124,8 @@ With no arguments, `shw` reads stdin if it is piped, otherwise opens `README.md`
 | `1` | 100 % | click bar | seek | `g` `G` | top / bottom |
 | `r` `R` | rotate | wheel, `+` `-` `0` | zoom | `/` `n` `N` | search |
 | `n` `p` | next / prev file | `m` `l` `.` `s` | mute, loop, step, save frame | `Tab` | next file |
-| | | | | `t` | dark / bright theme |
+| `b` | background (transparent images) | | | `t` | dark / bright theme |
+| | | | | `e` | edit in `$VISUAL` / `$EDITOR` (markdown) |
 | `?` | help | `?` | help | `?` | help |
 
 `q` or `Esc` quits everywhere. The bottom line of every viewer lists its keys.
