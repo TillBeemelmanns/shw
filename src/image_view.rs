@@ -82,7 +82,10 @@ impl Background {
 static BACKGROUND: AtomicU8 = AtomicU8::new(0);
 
 /// Over ssh, how long input must pause before a sharp frame is sent.
-const REMOTE_SETTLE: Duration = Duration::from_millis(150);
+const REMOTE_SETTLE: Duration = Duration::from_millis(300);
+/// Sharp frames over ssh are written in pieces of at least this size, checking
+/// for user input in between so a new zoom / drag can cancel the frame.
+const INTERRUPT_PIECE: usize = 32 * 1024;
 /// Largest proxy image uploaded once for remote zooming / panning, in pixels.
 const PROXY_MAX_PIXELS: f64 = 6.0e6;
 
@@ -98,6 +101,59 @@ struct Proxy {
     bg: Background,
     /// Cell grid (columns, rows) of the current virtual placement.
     grid: Option<(u32, u32)>,
+}
+
+/// User input that should cancel a sharp frame in flight (not plain pointer
+/// motion or key releases).
+fn is_input(ev: &Event) -> bool {
+    match ev {
+        Event::Mouse(m) => m.kind != MouseEventKind::Moved,
+        Event::Key(k) => k.kind != crossterm::event::KeyEventKind::Release,
+        Event::Resize(..) => true,
+        _ => false,
+    }
+}
+
+/// End of the next complete escape sequence (string terminator `ESC \`) at
+/// or after `from`. A terminator preceded by another ESC is an escaped one
+/// inside a tmux passthrough wrapper, not the end of a sequence.
+fn next_boundary(data: &[u8], from: usize) -> usize {
+    let mut i = from.max(1);
+    while i + 1 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'\\' && data[i - 1] != 0x1b {
+            return i + 2;
+        }
+        i += 1;
+    }
+    data.len()
+}
+
+/// Write `data` in pieces cut at escape-sequence boundaries, stopping early
+/// when user input arrives. Returns whether it stopped early and the events
+/// read meanwhile (to be handled by the caller).
+fn write_interruptible(data: &[u8]) -> (bool, Vec<Event>) {
+    use std::io::Write;
+    let mut evs = Vec::new();
+    let mut pos = 0;
+    let mut stdout = std::io::stdout().lock();
+    while pos < data.len() {
+        let end = next_boundary(data, pos + INTERRUPT_PIECE);
+        if stdout.write_all(&data[pos..end]).is_err() || stdout.flush().is_err() {
+            break;
+        }
+        pos = end;
+        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            match crossterm::event::read() {
+                Ok(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Release => {}
+                Ok(ev) => evs.push(ev),
+                Err(_) => break,
+            }
+        }
+        if pos < data.len() && evs.iter().any(is_input) {
+            return (true, evs);
+        }
+    }
+    (false, evs)
 }
 
 /// Visible part of a `grid`-cell long axis in `avail` cells around `center`:
@@ -144,6 +200,9 @@ struct Viewer<'a> {
     proxy: Option<Proxy>,
     /// The proxy placement is what is currently on screen.
     on_proxy: bool,
+    /// Size and background of the shown sharp frame when it covers the whole
+    /// picture, so it can be adopted as the proxy without another upload.
+    shown_full: Option<(u32, u32, Background)>,
 }
 
 impl<'a> Viewer<'a> {
@@ -277,10 +336,29 @@ impl<'a> Viewer<'a> {
             }
         }
         self.drop_proxy(out);
-        let (aw, ah) = self.area(ws);
+        // The frame on screen shows the whole picture (the usual case when
+        // zooming starts): adopt it as the proxy, so nothing is uploaded.
+        if let (true, Some((w, h, bg))) = (self.shown, self.shown_full) {
+            if bg == self.bg {
+                let id = self.ids[self.cur];
+                self.ids[self.cur] = next_id();
+                self.shown = false;
+                self.shown_full = None;
+                self.on_proxy = true;
+                self.proxy = Some(Proxy {
+                    id,
+                    w,
+                    h,
+                    bg,
+                    grid: None,
+                });
+                return (id, w, h);
+            }
+        }
+        // Otherwise upload the picture at its default (whole-picture) size:
+        // about as much data as one sharp frame.
         let (iw, ih) = self.dims();
-        // Twice the fitted size covers moderate zoom without a re-send.
-        let mut s = (2.0 * aw / iw).min(2.0 * ah / ih);
+        let mut s = self.default_zoom(ws);
         if self.pic.svg.is_none() {
             s = s.min(1.0);
         }
@@ -414,22 +492,36 @@ impl<'a> Viewer<'a> {
         let (aw, ah) = self.area(ws);
         let (iw, ih) = self.dims();
         let z = self.zoom;
-        let (_, disp_w, disp_h) = self.view(ws);
-        // The placement covers whole cells; pick the source rectangle that
-        // fills exactly that many cells at the current zoom.
-        let cols = (disp_w / cw).round().clamp(1.0, (aw / cw).round().max(1.0));
-        let rows = (disp_h / ch).round().clamp(1.0, (ah / ch).round().max(1.0));
-        let sw = (cols * cw / z).min(iw);
-        let sh = (rows * ch / z).min(ih);
-        let sx = (self.cx - sw / 2.0).clamp(0.0, iw - sw);
-        let sy = (self.cy - sh / 2.0).clamp(0.0, ih - sh);
+        let (crop, disp_w, disp_h) = self.view(ws);
         let (kx, ky) = (pw as f64 / iw, ph as f64 / ih);
-        let x = ((sx * kx).round() as u32).min(pw - 1);
-        let y = ((sy * ky).round() as u32).min(ph - 1);
-        let w = ((sw * kx).round() as u32).clamp(1, pw - x);
-        let h = ((sh * ky).round() as u32).clamp(1, ph - y);
-        let off_x = ((aw - cols * cw) / 2.0).max(0.0);
-        let off_y = ((ah - rows * ch) / 2.0).max(0.0);
+        let (x, y, w, h, size, off_x, off_y);
+        if (z / kx - 1.0).abs() < 1e-3 {
+            // The proxy has exactly the display resolution: show its pixels
+            // 1:1 (no scaling, pixel-exact like a sharp frame).
+            w = (disp_w.round() as u32).clamp(1, pw);
+            h = (disp_h.round() as u32).clamp(1, ph);
+            x = ((crop.0 * kx).round() as u32).min(pw - w);
+            y = ((crop.1 * ky).round() as u32).min(ph - h);
+            size = String::new();
+            off_x = ((aw - w as f64) / 2.0).max(0.0);
+            off_y = ((ah - h as f64) / 2.0).max(0.0);
+        } else {
+            // The placement covers whole cells; pick the source rectangle that
+            // fills exactly that many cells at the current zoom.
+            let cols = (disp_w / cw).round().clamp(1.0, (aw / cw).round().max(1.0));
+            let rows = (disp_h / ch).round().clamp(1.0, (ah / ch).round().max(1.0));
+            let sw = (cols * cw / z).min(iw);
+            let sh = (rows * ch / z).min(ih);
+            let sx = (self.cx - sw / 2.0).clamp(0.0, iw - sw);
+            let sy = (self.cy - sh / 2.0).clamp(0.0, ih - sh);
+            x = ((sx * kx).round() as u32).min(pw - 1);
+            y = ((sy * ky).round() as u32).min(ph - 1);
+            w = ((sw * kx).round() as u32).clamp(1, pw - x);
+            h = ((sh * ky).round() as u32).clamp(1, ph - y);
+            size = format!("c={},r={},", cols as u32, rows as u32);
+            off_x = ((aw - cols * cw) / 2.0).max(0.0);
+            off_y = ((ah - rows * ch) / 2.0).max(0.0);
+        }
         let col = (off_x / cw).floor();
         let row = (off_y / ch).floor();
         let xo = ((off_x - col * cw).floor() as u32).min(cw as u32 - 1);
@@ -439,8 +531,7 @@ impl<'a> Viewer<'a> {
         k.cmd(
             &mut out,
             &format!(
-                "a=p,i={id},p=1,x={x},y={y},w={w},h={h},c={},r={},X={xo},Y={yo},C=1,{Z_BELOW_BG},q=2",
-                cols as u32, rows as u32
+                "a=p,i={id},p=1,x={x},y={y},w={w},h={h},{size}X={xo},Y={yo},C=1,{Z_BELOW_BG},q=2"
             ),
         );
         if self.shown {
@@ -480,7 +571,11 @@ impl<'a> Viewer<'a> {
         self.on_proxy = false;
     }
 
-    fn render(&mut self, ws: WinSize, filter: Filter) {
+    /// Draw a sharp frame of the current view. With `interruptible`, the
+    /// frame is cancelled when user input arrives while it is being written
+    /// (the proxy stays on screen). Returns whether it was cancelled and the
+    /// events read while writing, which the caller must handle.
+    fn render(&mut self, ws: WinSize, filter: Filter, interruptible: bool) -> (bool, Vec<Event>) {
         let t0 = Instant::now();
         let (cw, ch) = ws.cell();
         let (aw, ah) = self.area(ws);
@@ -490,6 +585,12 @@ impl<'a> Viewer<'a> {
             disp_w.round().max(1.0) as u32,
             disp_h.round().max(1.0) as u32,
         );
+        let (iw0, ih0) = self.dims();
+        let full = !self.pic.is_animated()
+            && crop.0 < 0.5
+            && crop.1 < 0.5
+            && crop.2 >= iw0 - 0.5
+            && crop.3 >= ih0 - 0.5;
 
         let (level, scale) = self.source_for(z);
         let raster: Cow<Raster> = if let Some(tree) = &self.pic.svg {
@@ -567,6 +668,7 @@ impl<'a> Viewer<'a> {
                 ),
             );
         }
+        let before = (self.cur, self.shown, self.on_proxy);
         if self.shown {
             k.delete(&mut out, old_id);
         }
@@ -578,10 +680,28 @@ impl<'a> Viewer<'a> {
         self.shown = true;
         out.extend_from_slice(self.status(ws).as_bytes());
         out.extend_from_slice(b"\x1b[?2026l");
-        self.ctx.write(&out);
+        let mut evs = Vec::new();
+        if interruptible {
+            let (cut, read) = write_interruptible(&out);
+            evs = read;
+            if cut {
+                // A delete aborts the partial upload (kitty spec); the proxy
+                // was not touched, so it is still what is on screen.
+                let mut tail = Vec::new();
+                self.ctx.kitty.delete(&mut tail, new_id);
+                tail.extend_from_slice(b"\x1b[?2026l");
+                self.ctx.write(&tail);
+                (self.cur, self.shown, self.on_proxy) = before;
+                return (true, evs);
+            }
+        } else {
+            self.ctx.write(&out);
+        }
+        self.shown_full = full.then_some((dw, dh, self.bg));
         if filter == Filter::Lanczos {
             self.last_render = t0.elapsed();
         }
+        (false, evs)
     }
 
     fn status(&self, ws: WinSize) -> String {
@@ -663,6 +783,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         remote: ctx.kitty.compress && ctx.kitty.transfer == Transfer::Direct,
         proxy: None,
         on_proxy: false,
+        shown_full: None,
     };
     // Over ssh, zoom / pan by re-placing an uploaded proxy (pointless for
     // animations, which re-send every frame anyway).
@@ -674,6 +795,10 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
     let mut interactive = false;
     // The last events only zoomed or panned.
     let mut moved = false;
+    // The pending render is the sharp frame after remote zooming / panning.
+    let mut refine = false;
+    // Events read while a cancelled sharp frame was being written.
+    let mut pending: Vec<Event> = Vec::new();
 
     let nav = loop {
         if dirty {
@@ -694,15 +819,18 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
             } else {
                 // While zooming / dragging, draw with a fast filter; refine when idle.
                 let fast = !v.remote && interactive && v.last_render > Duration::from_millis(20);
-                v.render(
-                    ws,
-                    if fast {
-                        Filter::Bilinear
-                    } else {
-                        Filter::Lanczos
-                    },
-                );
+                let filter = if fast {
+                    Filter::Bilinear
+                } else {
+                    Filter::Lanczos
+                };
                 v.hq_due = fast.then(|| Instant::now() + Duration::from_millis(120));
+                let (cancelled, evs) = v.render(ws, filter, refine && v.on_proxy);
+                pending = evs;
+                if cancelled {
+                    // New input arrived: handle it, retry after the next pause.
+                    v.hq_due = Some(Instant::now() + REMOTE_SETTLE);
+                }
             }
             if animated && !v.paused && v.next_frame.is_none() {
                 v.next_frame = Some(Instant::now() + v.pic.frames[v.frame].delay);
@@ -710,6 +838,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
             dirty = false;
             interactive = false;
             moved = false;
+            refine = false;
         }
 
         let now = Instant::now();
@@ -720,13 +849,21 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         if let (Some(t), false, false) = (v.next_frame, v.paused, v.help) {
             deadline = deadline.min(t);
         }
-        let evs = read_events(deadline.saturating_duration_since(now))?;
+        let evs = if pending.is_empty() {
+            read_events(deadline.saturating_duration_since(now))?
+        } else {
+            std::mem::take(&mut pending)
+        };
         let now = Instant::now();
         if evs.is_empty() {
             if v.hq_due.is_some_and(|t| now >= t) {
                 v.hq_due = None;
-                if !v.on_proxy || v.needs_refine() {
+                if v.remote && v.drag.is_some() {
+                    // Mouse button still held mid-drag: no sharp frame yet.
+                    v.hq_due = Some(now + REMOTE_SETTLE);
+                } else if !v.on_proxy || v.needs_refine() {
                     dirty = true;
+                    refine = v.remote;
                 }
             }
             if let Some(t) = v.next_frame {
@@ -927,7 +1064,20 @@ pub fn print_inline(ctx: &Ctx, pic: &Picture, ws: WinSize, upscale: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::grid_window;
+    use super::{grid_window, next_boundary};
+
+    #[test]
+    fn boundaries_skip_escaped_terminators() {
+        // plain: cut after each ST
+        let plain = b"\x1b_Ga;AAAA\x1b\\\x1b_Gm=0;BB\x1b\\";
+        assert_eq!(next_boundary(plain, 0), 11);
+        assert_eq!(next_boundary(plain, 11), plain.len());
+        // tmux passthrough: the inner (doubled-ESC) ST is not a boundary
+        let wrapped = crate::kitty::tmux_wrap("\x1b_Ga;AAAA\x1b\\");
+        let w = wrapped.as_bytes();
+        assert_eq!(next_boundary(w, 0), w.len());
+        assert_eq!(next_boundary(b"no terminator", 0), 13);
+    }
 
     #[test]
     fn grid_window_centres_and_clamps() {

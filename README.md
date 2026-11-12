@@ -172,8 +172,8 @@ shw --completions fish > ~/.config/fish/completions/shw.fish
 | others | ❌ `shw` reports that the protocol is missing |
 
 - **ssh**: works out of the box. Data is sent inline and PNG-compressed. When you zoom or pan an image,
-  shw uploads a downscaled copy once and moves it in the terminal (a few bytes per step, also inside
-  tmux); one sharp frame follows when you stop. Video frames are capped at 640×360 and 30 fps for
+  shw reuses the frame already on screen and lets the terminal scale and move it (a few bytes per step,
+  also inside tmux); one sharp frame follows when you stop, and is cancelled if you move again. Video frames are capped at 640×360 and 30 fps for
   smooth playback over a network, and the terminal scales them up.
 - **tmux**: enable passthrough with `set -g allow-passthrough on`. shw then uses Unicode placeholders automatically.
 - Run `shw --doctor` to see what was detected.
