@@ -144,13 +144,13 @@ alias fzfp="fzf --preview 'shw -i {}' --preview-window=right:60%"
 
 ```toml
 [opener]
-shw = [{ run = 'shw "$@"', block = true, desc = "shw" }]
+shw = [{ run = 'shw %s', block = true, desc = "shw" }]
 
 [open]
 prepend_rules = [
   { mime = "image/*", use = ["shw", "open"] },
   { mime = "video/*", use = ["shw", "open"] },
-  { name = "*.md",    use = ["shw", "edit"] },
+  { url = "*.md",     use = ["shw", "edit"] },
 ]
 ```
 
@@ -188,20 +188,6 @@ shw --completions fish > ~/.config/fish/completions/shw.fish
   `set -as terminal-features ',xterm*:sync'` to your tmux config so tmux also wraps its own redraws in
   synchronized updates.
 - Run `shw --doctor` to see what was detected.
-
-## How it works
-
-On startup shw sends a handful of queries, terminated by a DA1 sentinel, so detection never hangs. They check for kitty
-graphics support, which transfer modes work (direct, temp file, shared memory), the background colour (for the light
-or dark theme), the cell size in pixels and text-sizing support. Every frame is resampled to the exact number of device
-pixels the terminal will show, so the terminal never rescales the image. Updates are wrapped in synchronized-output
-mode and swap between two image ids, so they don't flicker.
-
-## Security
-
-shw is designed to be safe on untrusted files: no terminal escape injection, no script execution,
-only safe links are clickable, and remote images only come from public hosts (`--offline` disables
-downloads). Release archives ship with checksums and signed build provenance. See [SECURITY.md](SECURITY.md).
 
 ## Development
 
