@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind
 
 use crate::app::{is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS};
 use crate::diacritics::DIACRITICS;
-use crate::kitty::{next_id, placeholder_row, placeholder_row_at, Transfer, Z_BELOW_BG};
+use crate::kitty::{next_id, placeholder_row_at, Transfer, Z_BELOW_BG};
 use crate::raster::{render_svg, resize, resize_region, Filter, Picture, Raster};
 use crate::term::WinSize;
 use crate::ui::{help_screen, hint_bar, status_bar};
@@ -180,6 +180,62 @@ fn write_interruptible(data: &[u8]) -> (bool, Vec<Event>) {
     (false, evs)
 }
 
+/// Placeholder text for the image area (`area_rows` x `cols` cells): screen
+/// rows `row0..row0 + vr` show grid rows from `sr` and grid columns from `sc`
+/// (`vc` cells) starting at screen column `col0`. Everything is overwritten in
+/// place and only uncovered margins / rows are erased, never the whole screen
+/// first: tmux redraws as it reads, and would show the empty screen (flicker).
+fn placeholder_frame(
+    id: u32,
+    area_rows: u32,
+    cols: u32,
+    (row0, col0): (u32, u32),
+    (sr, sc): (u32, u32),
+    (vr, vc): (u32, u32),
+) -> String {
+    let mut s = String::with_capacity((vr * vc * 4 + area_rows * 16) as usize);
+    for r in 0..area_rows {
+        if r >= row0 && r < row0 + vr {
+            s.push_str(&format!("\x1b[{};1H\x1b[0m", r + 1));
+            if col0 > 0 {
+                s.push_str(&format!("\x1b[{col0}X"));
+            }
+            s.push_str(&format!(
+                "\x1b[{};{}H{}\x1b[0m",
+                r + 1,
+                col0 + 1,
+                placeholder_row_at(id, sr + r - row0, sc, vc)
+            ));
+            // After the last column the cursor stays on it: erasing from
+            // there would wipe the last cell, so only erase a real margin.
+            if col0 + vc < cols {
+                s.push_str("\x1b[K");
+            }
+        } else {
+            s.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[2K", r + 1));
+        }
+    }
+    s
+}
+
+/// Only the first placeholder cell of each row: it names the row and the
+/// first column; the rest of the row continues from it. When just the grid
+/// offset changes (panning, zooming a picture larger than the window), this is
+/// all that needs rewriting (~3 KB instead of the whole ~50 KB grid), which tmux
+/// passes on in one piece, so the terminal never shows a half-updated frame.
+fn placeholder_heads(id: u32, (row0, col0): (u32, u32), (sr, sc): (u32, u32), vr: u32) -> String {
+    let mut s = String::from("\x1b[0m");
+    for r in 0..vr {
+        s.push_str(&format!(
+            "\x1b[{};{}H{}",
+            row0 + r + 1,
+            col0 + 1,
+            placeholder_row_at(id, sr + r, sc, 1)
+        ));
+    }
+    s
+}
+
 /// Visible part of a `grid`-cell long axis in `avail` cells around `center`:
 /// (first grid cell, number of cells, screen offset in cells).
 fn grid_window(grid: f64, avail: f64, center: f64) -> (u32, u32, u32) {
@@ -230,6 +286,9 @@ struct Viewer<'a> {
     /// Size and background of the shown sharp frame when it covers the whole
     /// picture, so it can be adopted as the proxy without another upload.
     shown_full: Option<(u32, u32, Background)>,
+    /// Placeholder text on screen: (image id, screen row, screen column,
+    /// rows, columns). Same layout again → only the row heads are rewritten.
+    cells: Option<(u32, u32, u32, u32, u32)>,
 }
 
 impl<'a> Viewer<'a> {
@@ -600,9 +659,9 @@ impl<'a> Viewer<'a> {
         let k = &self.ctx.kitty;
         if let Some(p) = self.proxy.as_mut() {
             if p.grid != Some(layout.grid) {
-                // Drop the old virtual placement (keeping the data), then create
-                // one for the new grid; exactly one exists for the image.
-                k.cmd(&mut out, &format!("a=d,d=i,i={id},q=2"));
+                // Replace the virtual placement (same image and placement id)
+                // instead of deleting it first: a delete would leave the cells
+                // without an image for a moment (flicker).
                 k.cmd(
                     &mut out,
                     &format!(
@@ -613,18 +672,28 @@ impl<'a> Viewer<'a> {
                 p.grid = Some(layout.grid);
             }
         }
-        out.extend_from_slice(b"\x1b[0m\x1b[2J");
-        for r in 0..layout.vr {
-            out.extend_from_slice(
-                format!(
-                    "\x1b[{};{}H{}",
-                    layout.row0 + r + 1,
-                    layout.col0 + 1,
-                    placeholder_row_at(id, layout.sr + r, layout.sc, layout.vc)
-                )
-                .as_bytes(),
-            );
-        }
+        let (aw, ah) = self.area(ws);
+        let (cw, ch) = ws.cell();
+        let key = (id, layout.row0, layout.col0, layout.vr, layout.vc);
+        let text = if self.cells == Some(key) {
+            placeholder_heads(
+                id,
+                (layout.row0, layout.col0),
+                (layout.sr, layout.sc),
+                layout.vr,
+            )
+        } else {
+            placeholder_frame(
+                id,
+                (ah / ch).round().max(1.0) as u32,
+                (aw / cw).round().max(1.0) as u32,
+                (layout.row0, layout.col0),
+                (layout.sr, layout.sc),
+                (layout.vr, layout.vc),
+            )
+        };
+        out.extend_from_slice(text.as_bytes());
+        self.cells = Some(key);
         if self.shown {
             k.delete(&mut out, self.ids[self.cur]);
             self.shown = false;
@@ -818,6 +887,7 @@ impl<'a> Viewer<'a> {
             "render {rw}x{rh} for {dw}x{dh} {filter:?}: pixels ready"
         ));
 
+        let cells_before = self.cells;
         let k = &self.ctx.kitty;
         let new_id = self.ids[1 - self.cur];
         let old_id = self.ids[self.cur];
@@ -838,20 +908,21 @@ impl<'a> Viewer<'a> {
             k.transmit(
                 &mut out,
                 &raster,
-                &format!("a=T,U=1,i={new_id},c={cols},r={rows}"),
+                // p=1 so a later proxy grid can replace this placement.
+                &format!("a=T,U=1,i={new_id},p=1,c={cols},r={rows}"),
             );
-            out.extend_from_slice(b"\x1b[0m\x1b[2J");
-            for r in 0..rows {
-                out.extend_from_slice(
-                    format!(
-                        "\x1b[{};{}H{}",
-                        row0 + r + 1,
-                        col0 + 1,
-                        placeholder_row(new_id, r, cols)
-                    )
-                    .as_bytes(),
-                );
-            }
+            out.extend_from_slice(
+                placeholder_frame(
+                    new_id,
+                    ar as u32,
+                    ac as u32,
+                    (row0, col0),
+                    (0, 0),
+                    (rows, cols),
+                )
+                .as_bytes(),
+            );
+            self.cells = Some((new_id, row0, col0, rows, cols));
         } else {
             // A terminal-scaled frame fills whole cells.
             let (off_x, off_y, size) = match cells {
@@ -903,6 +974,7 @@ impl<'a> Viewer<'a> {
                 tail.extend_from_slice(b"\x1b[?2026l");
                 self.ctx.write(&tail);
                 (self.cur, self.shown, self.on_proxy) = before;
+                self.cells = cells_before;
                 return (true, evs);
             }
         } else {
@@ -964,6 +1036,7 @@ impl<'a> Viewer<'a> {
         out.extend_from_slice(b"\x1b[0m\x1b[2J");
         self.ctx.write(&out);
         self.shown = false;
+        self.cells = None;
     }
 }
 
@@ -997,6 +1070,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         spare: None,
         on_proxy: false,
         shown_full: None,
+        cells: None,
     };
     // Over ssh, zoom / pan by re-placing an uploaded proxy (pointless for
     // animations, which re-send every frame anyway).
@@ -1277,7 +1351,7 @@ pub fn print_inline(ctx: &Ctx, pic: &Picture, ws: WinSize, upscale: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{grid_window, next_boundary};
+    use super::{grid_window, next_boundary, placeholder_frame, placeholder_heads};
 
     #[test]
     fn boundaries_skip_escaped_terminators() {
@@ -1290,6 +1364,34 @@ mod tests {
         let w = wrapped.as_bytes();
         assert_eq!(next_boundary(w, 0), w.len());
         assert_eq!(next_boundary(b"no terminator", 0), 13);
+    }
+
+    #[test]
+    fn placeholder_frame_overwrites_in_place() {
+        // 10x4 area, image 6x2 cells at (row 1, col 2)
+        let s = placeholder_frame(7, 4, 10, (1, 2), (0, 0), (2, 6));
+        assert!(!s.contains("\x1b[2J"), "never clears the whole screen");
+        // rows outside the image are erased, rows with the image are not
+        assert!(s.contains("\x1b[1;1H\x1b[0m\x1b[2K"));
+        assert!(s.contains("\x1b[4;1H\x1b[0m\x1b[2K"));
+        assert!(!s.contains("\x1b[2;1H\x1b[0m\x1b[2K"));
+        // left margin blanked, right margin erased
+        assert!(s.contains("\x1b[2;1H\x1b[0m\x1b[2X\x1b[2;3H"));
+        assert_eq!(s.matches("\x1b[K").count(), 2);
+        // full width: no erase after the last cell (it would wipe it)
+        let full = placeholder_frame(7, 2, 10, (0, 0), (0, 0), (2, 10));
+        assert!(!full.contains("\x1b[K") && !full.contains("X\x1b"));
+    }
+
+    #[test]
+    fn placeholder_heads_rewrite_only_first_cells() {
+        let s = placeholder_heads(7, (1, 2), (5, 9), 3);
+        assert_eq!(s.matches('\u{10EEEE}').count(), 3);
+        assert!(s.contains("\x1b[2;3H") && s.contains("\x1b[4;3H"));
+        use crate::diacritics::DIACRITICS;
+        // first head: row 5, column 9
+        let first: String = [DIACRITICS[5], DIACRITICS[9]].iter().collect();
+        assert!(s.contains(&format!("\u{10EEEE}{first}")));
     }
 
     #[test]

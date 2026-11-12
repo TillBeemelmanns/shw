@@ -181,7 +181,9 @@ shw --completions fish > ~/.config/fish/completions/shw.fish
 - **tmux**: optimized for it, locally and over ssh. Enable passthrough with `set -g allow-passthrough on`; shw then
   uses Unicode placeholders automatically. Zooming and panning only rewrite placeholder cells (plain text that
   tmux redraws like anything else), so they stay smooth even for large images; when you zoom in far, shw uploads
-  a crop around the view once instead of re-sending every frame.
+  a crop around the view once instead of re-sending every frame. Optionally add
+  `set -as terminal-features ',xterm*:sync'` to your tmux config so tmux also wraps its own redraws in
+  synchronized updates.
 - Run `shw --doctor` to see what was detected.
 
 ## How it works

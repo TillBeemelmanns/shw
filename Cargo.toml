@@ -1,6 +1,6 @@
 [package]
 name = "shw"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "Blazing fast terminal viewer for images, videos and GitHub-flavored Markdown using the kitty graphics protocol"
 license = "MIT"
