@@ -5,7 +5,7 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -141,12 +141,9 @@ pub fn thumbnail(path: &str, at: f64, w: u32, h: u32) -> Result<Raster> {
         }
         return Err(anyhow!("could not decode a frame"));
     }
-    Ok(Raster {
-        w,
-        h,
-        ch: 3,
-        data: out.stdout[..need].to_vec(),
-    })
+    let mut data = out.stdout;
+    data.truncate(need);
+    Ok(Raster { w, h, ch: 3, data })
 }
 
 /// Viewport in source pixels (zoom / pan).
@@ -160,6 +157,9 @@ struct View {
 struct Pipeline {
     child: Child,
     rx: Receiver<Vec<u8>>,
+    /// Frame buffers that are no longer shown go back to the reader thread:
+    /// allocating a fresh one per frame costs megabytes of page faults.
+    spare: Sender<Vec<u8>>,
     fw: u32,
     fh: u32,
     fps: f64,
@@ -284,8 +284,10 @@ fn spawn_pipeline(
         .ok_or_else(|| anyhow!("no ffmpeg stdout"))?;
     let frame_len = (lay.fw * lay.fh * 3) as usize;
     let (tx, rx) = sync_channel::<Vec<u8>>(3);
+    let (spare, spares) = channel::<Vec<u8>>();
     std::thread::spawn(move || loop {
-        let mut buf = vec![0u8; frame_len];
+        let reused = spares.try_recv().ok().filter(|b| b.len() == frame_len);
+        let mut buf = reused.unwrap_or_else(|| vec![0u8; frame_len]);
         if stdout.read_exact(&mut buf).is_err() {
             break;
         }
@@ -296,6 +298,7 @@ fn spawn_pipeline(
     Ok(Pipeline {
         child,
         rx,
+        spare,
         fw: lay.fw,
         fh: lay.fh,
         fps,
@@ -526,6 +529,9 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
     let mut help = false;
     let mut drag: Option<(u16, u16)> = None;
     let mut need_status = true;
+    // second shown in the status line, and whether ffmpeg is behind the clock
+    let mut shown_second = -1i64;
+    let mut starved = false;
     let mut step = false;
     ctx.write(b"\x1b[0m\x1b[2J");
 
@@ -548,15 +554,21 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                 }
                 match pipe.rx.try_recv() {
                     Ok(f) => {
+                        starved = false;
                         pipe.frames += 1;
-                        frame = Some(f);
+                        if let Some(skipped) = frame.replace(f) {
+                            let _ = pipe.spare.send(skipped);
+                        }
                         if step {
                             step = false;
                             clock.set(pipe.start + pipe.frames as f64 / pipe.fps);
                             break;
                         }
                     }
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => {
+                        starved = true;
+                        break;
+                    }
                     Err(TryRecvError::Disconnected) => {
                         pipe.eof = true;
                         break;
@@ -641,7 +653,9 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                 }
                 cur = 1 - cur;
                 shown = true;
-                last_frame = Some(raster.data);
+                if let Some(old) = last_frame.replace(raster.data) {
+                    let _ = pipe.spare.send(old);
+                }
             }
             let m = msg.as_ref().map(|(s, _)| s.clone());
             let (s, bc) = status(
@@ -657,6 +671,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                 &m,
             );
             bar_cols = bc;
+            shown_second = clock.now() as i64;
             out.extend_from_slice(s.as_bytes());
             out.extend_from_slice(b"\x1b[?2026l");
             ctx.write(&out);
@@ -668,6 +683,9 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
             t.saturating_duration_since(Instant::now())
         } else if clock.paused || help {
             Duration::from_millis(500)
+        } else if starved {
+            // the next frame is due but not decoded yet: look again shortly
+            Duration::from_millis(4)
         } else {
             let due = pipe.start + pipe.frames as f64 / pipe.fps;
             Duration::from_secs_f64((due - clock.now()).clamp(0.001, 0.25))
@@ -872,12 +890,9 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
             }
             need_status = true;
         }
-        if !clock.paused && !help {
-            // refresh the time display about once per second
-            let t = clock.now();
-            if (t - t.floor()) < 0.05 {
-                need_status = true;
-            }
+        // the time display ticks even when no frame arrives
+        if !clock.paused && !help && clock.now() as i64 != shown_second {
+            need_status = true;
         }
     };
     kill_audio(&mut audio);
@@ -924,7 +939,7 @@ pub fn print_inline(ctx: &Ctx, path: &str, name: &str, ws: WinSize) -> Result<()
     let mut doc = crate::doc::Doc::default();
     let cols = (w as f64 / cw).ceil() as u32;
     let rows = (h as f64 / ch).ceil() as u32;
-    doc.image(raster, 0, cols, rows, Vec::new());
+    doc.image(raster.into(), 0, cols, rows, Vec::new(), String::new());
     let mut line = String::new();
     Style {
         fg: Some(ctx.theme.muted),

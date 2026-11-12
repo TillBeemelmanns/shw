@@ -232,18 +232,19 @@ impl Kitty {
             }
             Transfer::Direct => {}
         }
-        let (ctrl, payload) = if self.compress && img.data.len() > 4096 {
+        let mut compressed = None;
+        if self.compress && img.data.len() > 4096 {
             let mut enc =
                 ZlibEncoder::new(Vec::with_capacity(img.data.len() / 2), Compression::fast());
-            let _ = enc.write_all(&img.data);
-            (
-                format!("{base},o=z"),
-                enc.finish().unwrap_or_else(|_| img.data.clone()),
-            )
-        } else {
-            (base, img.data.clone())
+            if enc.write_all(&img.data).is_ok() {
+                compressed = enc.finish().ok();
+            }
+        }
+        let (ctrl, payload) = match &compressed {
+            Some(z) => (format!("{base},o=z"), z),
+            None => (base, &img.data),
         };
-        let encoded = b64.encode(&payload);
+        let encoded = b64.encode(payload);
         self.write_chunks(out, &ctrl, encoded.as_bytes());
     }
 

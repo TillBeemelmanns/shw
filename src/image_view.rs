@@ -1,6 +1,7 @@
 //! Interactive image viewer with pixel-exact rendering, zoom (mouse wheel at
 //! the pointer, + / -), panning (drag, hjkl) and animated GIF/WebP/APNG.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -186,8 +187,8 @@ impl<'a> Viewer<'a> {
         );
 
         let (level, scale) = self.source_for(z);
-        let raster: Raster = if let Some(tree) = &self.pic.svg {
-            render_svg(tree, crop, dw, dh)
+        let raster: Cow<Raster> = if let Some(tree) = &self.pic.svg {
+            Cow::Owned(render_svg(tree, crop, dw, dh))
         } else {
             let src = if level == 0 {
                 &self.pic.frames[self.frame].raster
@@ -203,11 +204,11 @@ impl<'a> Viewer<'a> {
             let (iw, ih) = (src.w as f64, src.h as f64);
             let f = if z >= 4.0 { Filter::Nearest } else { filter };
             if crop.0 == 0.0 && crop.1 == 0.0 && dw == src.w && dh == src.h {
-                src.clone()
+                Cow::Borrowed(src) // shown 1:1: no copy
             } else if f == Filter::Lanczos && crop.2 >= iw - 0.5 && crop.3 >= ih - 0.5 {
-                resize(src, dw, dh)
+                Cow::Owned(resize(src, dw, dh))
             } else {
-                resize_region(src, crop, dw, dh, f)
+                Cow::Owned(resize_region(src, crop, dw, dh, f))
             }
         };
 
@@ -543,9 +544,7 @@ pub fn print_inline(ctx: &Ctx, pic: &Picture, ws: WinSize, upscale: bool) {
     let raster = pic.render(dw, dh);
     let cols = (dw as f64 / cw).ceil().max(1.0) as u32;
     let rows = (dh as f64 / ch).ceil().max(1.0) as u32;
-    let id = next_id();
     let mut doc = crate::doc::Doc::default();
-    let _ = id;
-    doc.image(raster, 0, cols, rows, Vec::new());
+    doc.image(raster.into(), 0, cols, rows, Vec::new(), String::new());
     crate::pager::print_doc(ctx, &mut doc, ws.cols as usize);
 }

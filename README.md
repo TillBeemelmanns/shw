@@ -30,12 +30,16 @@ shw ~/Pictures         # browse a folder (n / p)
 - **Markdown**, rendered close to the way github.com renders it:
   - large semibold headings like GitHub's (H1 2×, H2 1.5×, H3 1.25×), typeset with a system font and drawn as
     images so they work in every kitty-graphics terminal; plus bold, italic and strikethrough
-  - syntax-highlighted code blocks, tables with alignment and zebra striping, task lists, footnotes, and
-    `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` alerts
-  - `:emoji:` shortcodes and clickable links (OSC 8)
+  - syntax-highlighted code blocks, tables with alignment and zebra striping, task lists, numbered footnotes,
+    and `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` alerts
+  - `:emoji:` shortcodes and clickable links (OSC 8), including bare URLs
   - **inline images** (local files, remote URLs, SVG badges from shields.io), HTML `<img width=…>` and
     `<p align="center">`
-  - mermaid diagrams, if [`mmdc`](https://github.com/mermaid-js/mermaid-cli) is installed
+  - **diagrams** in fenced code blocks, as on GitHub, drawn in a few milliseconds without external tools:
+    `mermaid` (flowcharts, sequence, class, state, ER, gantt, pie, …), `geojson` / `topojson` maps on a
+    base map of country outlines, and ASCII `stl` 3D models
+  - the document appears immediately; remote images are downloaded in the background and slot in as they
+    arrive
   - search with `/`, `n`, `N`; select text with the mouse to copy it (the terminal's native selection), and
     click links
 - **Code / text** files with syntax highlighting and line numbers, and a hex view for binaries.
@@ -66,7 +70,9 @@ git clone https://github.com/TillBeemelmanns/shw && cd shw
 cargo install --path .
 ```
 
-Optional runtime tools: `ffmpeg`/`ffprobe` for videos and HEIC/AVIF, `ffplay` for audio, `mmdc` for mermaid diagrams.
+Optional runtime tools: `ffmpeg`/`ffprobe` for videos and HEIC/AVIF, `ffplay` for audio, and
+[`mmdc`](https://github.com/mermaid-js/mermaid-cli) as a fallback for mermaid diagrams the built-in renderer
+cannot draw.
 
 ### Dotfiles
 

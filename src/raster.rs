@@ -205,21 +205,28 @@ fn fontdb() -> Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// Font files sufficient for headings: one sans-serif family plus colour emoji.
-/// Loading these takes a few milliseconds, versus ~100 ms to index every
-/// system font (810 faces on a stock macOS).
-const HEADING_FONT_FILES: &[&str] = &[
+/// Font files sufficient for headings and diagram labels: one sans-serif
+/// family plus colour emoji. Loading these takes a few milliseconds, versus
+/// ~100 ms to index every system font (810 faces on a stock macOS).
+const UI_FONT_FILES: &[&str] = &[
     "/System/Library/Fonts/HelveticaNeue.ttc",
     "/System/Library/Fonts/Apple Color Emoji.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
     "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf",
     "/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     "/usr/share/fonts/noto/NotoColorEmoji.ttf",
@@ -227,26 +234,31 @@ const HEADING_FONT_FILES: &[&str] = &[
     "/usr/share/fonts/google-noto-color-emoji-fonts/NotoColorEmoji.ttf",
 ];
 
-/// Small font database for headings, or None if no known heading font exists.
-fn heading_fontdb() -> Option<Arc<resvg::usvg::fontdb::Database>> {
+/// Small font database for text shw typesets itself, or None if none of the
+/// known fonts exist. Every generic family resolves to its sans-serif font.
+fn ui_fontdb() -> Option<Arc<resvg::usvg::fontdb::Database>> {
     use std::sync::OnceLock;
     static DB: OnceLock<Option<Arc<resvg::usvg::fontdb::Database>>> = OnceLock::new();
     DB.get_or_init(|| {
         let mut db = resvg::usvg::fontdb::Database::new();
-        for f in HEADING_FONT_FILES {
+        for f in UI_FONT_FILES {
             if Path::new(f).exists() {
                 let _ = db.load_font_file(f);
             }
         }
-        crate::app::trace(format!("heading fonts loaded ({} faces)", db.len()));
-        (!db.is_empty()).then(|| Arc::new(db))
+        let family = db.faces().next()?.families.first()?.0.clone();
+        db.set_sans_serif_family(&family);
+        db.set_serif_family(&family);
+        db.set_monospace_family(&family);
+        crate::app::trace(format!("ui fonts loaded ({} faces)", db.len()));
+        Some(Arc::new(db))
     })
     .clone()
 }
 
-/// Characters the heading fonts cover: Latin, punctuation, symbols and emoji.
+/// Characters the UI fonts cover: Latin, punctuation, symbols and emoji.
 /// Anything else (CJK, Arabic, …) needs the full system font index.
-fn heading_fonts_cover(text: &str) -> bool {
+fn ui_fonts_cover(text: &str) -> bool {
     text.chars().all(|c| {
         c <= '\u{024F}'
             || ('\u{2000}'..='\u{2BFF}').contains(&c)
@@ -255,15 +267,27 @@ fn heading_fonts_cover(text: &str) -> bool {
     })
 }
 
-fn heading_db_for(text: &str) -> Arc<resvg::usvg::fontdb::Database> {
-    match heading_fontdb() {
-        Some(db) if heading_fonts_cover(text) => db,
+fn ui_db_for(text: &str) -> Arc<resvg::usvg::fontdb::Database> {
+    match ui_fontdb() {
+        Some(db) if ui_fonts_cover(text) => db,
         _ => fontdb(),
     }
 }
 
+/// Does this SVG need fonts? Indexing the system fonts is the slowest part of
+/// showing an SVG, so documents without text skip it.
+fn svg_has_text(data: &[u8]) -> bool {
+    let has = |needle: &[u8]| data.windows(needle.len()).any(|w| w == needle);
+    data.starts_with(&[0x1f, 0x8b]) || has(b"<text") || has(b"<image")
+}
+
 pub fn parse_svg(data: &[u8], resources_dir: Option<&Path>) -> Result<resvg::usvg::Tree> {
-    parse_svg_with(data, resources_dir, fontdb())
+    let fonts = if svg_has_text(data) {
+        fontdb()
+    } else {
+        Arc::default()
+    };
+    parse_svg_with(data, resources_dir, fonts)
 }
 
 fn parse_svg_with(
@@ -331,23 +355,36 @@ fn looks_like_svg(data: &[u8]) -> bool {
     s.contains("<svg") || (s.trim_start().starts_with("<?xml") && s.contains("svg"))
 }
 
+fn svg_picture(tree: resvg::usvg::Tree) -> Picture {
+    let size = tree.size();
+    Picture {
+        frames: Vec::new(),
+        width: size.width().ceil().max(1.0) as u32,
+        height: size.height().ceil().max(1.0) as u32,
+        svg: Some(Arc::new(tree)),
+        format: "SVG".into(),
+    }
+}
+
+/// An SVG generated by shw itself (diagrams): its labels are set in the UI
+/// fonts, which avoids indexing every system font.
+pub fn decode_generated_svg(svg: &str) -> Result<Picture> {
+    Ok(svg_picture(parse_svg_with(
+        svg.as_bytes(),
+        None,
+        ui_db_for(svg),
+    )?))
+}
+
 /// Decode an image from memory. `hint` is a file name or URL used for format guessing.
-pub fn decode(data: Vec<u8>, hint: &str, resources_dir: Option<&Path>) -> Result<Picture> {
+pub fn decode(data: &[u8], hint: &str, resources_dir: Option<&Path>) -> Result<Picture> {
     let lower = hint.to_ascii_lowercase();
     let is_svg_ext = lower.ends_with(".svg") || lower.ends_with(".svgz");
-    if is_svg_ext || looks_like_svg(&data) {
-        let tree = parse_svg(&data, resources_dir)?;
-        let size = tree.size();
-        return Ok(Picture {
-            frames: Vec::new(),
-            width: size.width().ceil().max(1.0) as u32,
-            height: size.height().ceil().max(1.0) as u32,
-            svg: Some(Arc::new(tree)),
-            format: "SVG".into(),
-        });
+    if is_svg_ext || looks_like_svg(data) {
+        return Ok(svg_picture(parse_svg(data, resources_dir)?));
     }
 
-    let guessed = image::guess_format(&data)
+    let guessed = image::guess_format(data)
         .ok()
         .or_else(|| ImageFormat::from_path(hint).ok());
     match guessed {
@@ -358,19 +395,19 @@ pub fn decode(data: Vec<u8>, hint: &str, resources_dir: Option<&Path>) -> Result
     }
 }
 
-fn decode_raster(data: Vec<u8>, fmt: ImageFormat) -> Result<Picture> {
+fn decode_raster(data: &[u8], fmt: ImageFormat) -> Result<Picture> {
     let format = format!("{fmt:?}").to_uppercase();
 
     // Animated formats
     let frames: Option<Vec<image::Frame>> = match fmt {
-        ImageFormat::Gif => image::codecs::gif::GifDecoder::new(Cursor::new(&data))
+        ImageFormat::Gif => image::codecs::gif::GifDecoder::new(Cursor::new(data))
             .ok()
             .and_then(|d| d.into_frames().collect_frames().ok()),
-        ImageFormat::WebP => image::codecs::webp::WebPDecoder::new(Cursor::new(&data))
+        ImageFormat::WebP => image::codecs::webp::WebPDecoder::new(Cursor::new(data))
             .ok()
             .filter(|d| d.has_animation())
             .and_then(|d| d.into_frames().collect_frames().ok()),
-        ImageFormat::Png => image::codecs::png::PngDecoder::new(Cursor::new(&data))
+        ImageFormat::Png => image::codecs::png::PngDecoder::new(Cursor::new(data))
             .ok()
             .filter(|d| d.is_apng().unwrap_or(false))
             .and_then(|d| d.apng().ok())
@@ -399,8 +436,7 @@ fn decode_raster(data: Vec<u8>, fmt: ImageFormat) -> Result<Picture> {
         });
     }
 
-    let reader = ImageReader::with_format(Cursor::new(&data), fmt);
-    let mut reader = reader;
+    let mut reader = ImageReader::with_format(Cursor::new(data), fmt);
     reader.no_limits();
     let mut decoder = reader.into_decoder().context("unsupported image")?;
     let orientation = decoder.orientation().ok();
@@ -458,13 +494,13 @@ fn decode_with_ffmpeg_bytes(path: &str) -> Result<Picture> {
         .extension()
         .map(|e| e.to_string_lossy().to_uppercase())
         .unwrap_or_else(|| "IMAGE".into());
-    let mut pic = decode_raster(out.stdout, ImageFormat::Png)?;
+    let mut pic = decode_raster(&out.stdout, ImageFormat::Png)?;
     pic.format = ext;
     Ok(pic)
 }
 
 /// Horizontal composition of images (badges in a row), aligned at the bottom.
-pub fn compose_row(items: &[Raster], gap: u32) -> Raster {
+pub fn compose_row(items: &[Arc<Raster>], gap: u32) -> Raster {
     let h = items.iter().map(|r| r.h).max().unwrap_or(1).max(1);
     let w = items.iter().map(|r| r.w).sum::<u32>() + gap * items.len().saturating_sub(1) as u32;
     let w = w.max(1);
@@ -496,32 +532,70 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn text_svg(text: &str, size: f64, w: f64, h: f64, baseline: f64, color: (u8, u8, u8)) -> String {
-    format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}"><text x="0" y="{baseline:.2}" font-family="{HEADING_FONTS}" font-weight="600" font-size="{size:.2}" fill="#{:02x}{:02x}{:02x}">{}</text></svg>"##,
+/// Lay out one line of semibold text. Returns the parsed document and the
+/// width of the text in px, or None if no font is available.
+fn text_line(
+    text: &str,
+    size: f64,
+    h: u32,
+    color: (u8, u8, u8),
+) -> Option<(resvg::usvg::Tree, f64)> {
+    // vertically centred on the cap height
+    let baseline = h as f64 / 2.0 + size * 0.36;
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="20000" height="{h}"><text x="0" y="{baseline:.2}" font-family="{HEADING_FONTS}" font-weight="600" font-size="{size:.2}" fill="#{:02x}{:02x}{:02x}">{}</text></svg>"##,
         color.0,
         color.1,
         color.2,
         xml_escape(text)
-    )
-}
-
-/// Rendered width of `text` at `size` px (semibold), or None if no font is available.
-pub fn text_width(text: &str, size: f64) -> Option<f64> {
-    let svg = text_svg(text, size, 20000.0, size * 2.0, size * 1.5, (0, 0, 0));
-    let tree = parse_svg_with(svg.as_bytes(), None, heading_db_for(text)).ok()?;
+    );
+    let tree = parse_svg_with(svg.as_bytes(), None, ui_db_for(text)).ok()?;
     let bb = tree.root().bounding_box()?;
-    (bb.width() > 0.0).then(|| bb.right() as f64)
+    (bb.width() > 0.0).then(|| (tree, bb.right() as f64))
 }
 
-/// Render one line of text into an RGBA raster exactly `h` px tall,
-/// vertically centred on the cap height.
-pub fn render_text_line(text: &str, size: f64, h: u32, color: (u8, u8, u8)) -> Option<Raster> {
-    let w = text_width(text, size)?.ceil() + 2.0;
-    let baseline = h as f64 / 2.0 + size * 0.36;
-    let svg = text_svg(text, size, w, h as f64, baseline, color);
-    let tree = parse_svg_with(svg.as_bytes(), None, heading_db_for(text)).ok()?;
-    Some(render_svg(&tree, (0.0, 0.0, w, h as f64), w as u32, h))
+/// Typeset `text` as semibold lines at most `max_w` px wide. Each line is an
+/// RGBA raster exactly `h` px tall, returned with the text it shows.
+/// None if no font is available.
+pub fn typeset(
+    text: &str,
+    size: f64,
+    h: u32,
+    max_w: f64,
+    color: (u8, u8, u8),
+) -> Option<Vec<(Raster, String)>> {
+    let draw = |(tree, w): (resvg::usvg::Tree, f64)| {
+        let w = w.ceil() + 2.0;
+        render_svg(&tree, (0.0, 0.0, w, h as f64), w as u32, h)
+    };
+    // Almost every heading fits on one line: lay it out once and draw that.
+    let whole = text_line(text, size, h, color)?;
+    if whole.1 <= max_w {
+        return Some(vec![(draw(whole), text.to_string())]);
+    }
+    // Otherwise wrap greedily, measuring each word once.
+    let width = |t: &str| text_line(t, size, h, color).map(|l| l.1);
+    let space = (width("x x")? - 2.0 * width("x")?).max(0.0);
+    let mut lines: Vec<String> = Vec::new();
+    let (mut cur, mut cur_w) = (String::new(), 0.0);
+    for word in text.split(' ') {
+        let w = width(word)?;
+        if !cur.is_empty() && cur_w + space + w > max_w {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if cur.is_empty() {
+            cur_w = w;
+        } else {
+            cur.push(' ');
+            cur_w += space + w;
+        }
+        cur.push_str(word);
+    }
+    lines.push(cur);
+    lines
+        .into_iter()
+        .map(|l| Some((draw(text_line(&l, size, h, color)?), l)))
+        .collect()
 }
 
 /// GitHub-style task list checkbox drawn into a `w` x `h` (2 x 1 cells) raster.
@@ -567,9 +641,7 @@ pub fn checkbox(
     let svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{shape}</svg>"#
     );
-    // no text in the icon: skip loading system fonts
-    let no_fonts = Arc::new(resvg::usvg::fontdb::Database::new());
-    match parse_svg_with(svg.as_bytes(), None, no_fonts) {
+    match parse_svg(svg.as_bytes(), None) {
         Ok(tree) => render_svg(&tree, (0.0, 0.0, w as f64, h as f64), w, h),
         Err(_) => Raster {
             w,
@@ -580,10 +652,11 @@ pub fn checkbox(
     }
 }
 
-/// Load the system font database in the background so the first heading is fast.
+/// Index the system fonts in the background, for SVG images with text.
 pub fn warm_fonts() {
-    std::thread::spawn(|| {
-        let _ = fontdb();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(fontdb);
     });
 }
 
@@ -593,8 +666,10 @@ mod tests {
 
     #[test]
     fn heading_font_coverage() {
-        assert!(heading_fonts_cover("Roadmap — v1.0 🚀 ✓ Ünïcödé"));
-        assert!(!heading_fonts_cover("路线图"));
+        assert!(ui_fonts_cover("Roadmap — v1.0 🚀 ✓ Ünïcödé"));
+        assert!(!ui_fonts_cover("路线图"));
+        assert!(svg_has_text(b"<svg><text>a</text></svg>"));
+        assert!(!svg_has_text(b"<svg><rect/></svg>"));
     }
 
     #[test]
@@ -614,7 +689,7 @@ mod tests {
     #[test]
     fn decodes_svg() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="red"/></svg>"#;
-        let pic = decode(svg.to_vec(), "x.svg", None).unwrap();
+        let pic = decode(svg, "x.svg", None).unwrap();
         assert_eq!((pic.width, pic.height), (20, 10));
         let r = pic.render(40, 20);
         assert_eq!(&r.data[0..4], &[255, 0, 0, 255]);

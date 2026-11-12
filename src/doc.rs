@@ -1,6 +1,8 @@
 //! A laid-out document: rows of styled text and image slices. Produced by the
 //! markdown / code renderers and consumed by the pager or inline printer.
 
+use std::sync::Arc;
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::raster::Raster;
@@ -24,7 +26,7 @@ pub enum Row {
 }
 
 pub struct DocImage {
-    pub raster: Raster,
+    pub raster: Arc<Raster>,
     pub cols: u32,
     pub rows: u32,
     /// Column (0-based) where the image starts.
@@ -35,8 +37,9 @@ pub struct DocImage {
     pub sent: bool,
     /// Text represented by the image (headings), used for search.
     pub alt: String,
-    /// Small image drawn over a text row (task list checkbox) instead of on its own rows.
-    pub icon: bool,
+    /// Drawn over text rows that leave room for it (task list checkbox,
+    /// picture in a table cell) instead of on rows of its own.
+    pub overlay: bool,
 }
 
 #[derive(Default)]
@@ -47,6 +50,9 @@ pub struct Doc {
     pub width: usize,
     /// Left margin in cells applied when drawing.
     pub margin: u16,
+    /// (source byte offset, row) of block starts, both ascending. They keep
+    /// the reading position when the document is laid out again.
+    anchors: Vec<(usize, usize)>,
 }
 
 impl Doc {
@@ -89,14 +95,34 @@ impl Doc {
         }
     }
 
-    /// Add an image with given cell geometry; `prefix` is drawn left of each row.
-    pub fn image(&mut self, raster: Raster, col: u32, cols: u32, rows: u32, prefix: Vec<Span>) {
-        self.image_alt(raster, col, cols, rows, prefix, String::new());
+    /// Note that the next row starts the block at source byte `offset`.
+    pub fn anchor(&mut self, offset: usize) {
+        let row = self.rows.len();
+        match self.anchors.last() {
+            Some(&(o, r)) if offset <= o || row <= r => {}
+            _ => self.anchors.push((offset, row)),
+        }
     }
 
-    pub fn image_alt(
+    /// Source position of `row`: the block it belongs to and the rows past its start.
+    pub fn locate(&self, row: usize) -> Option<(usize, usize)> {
+        let i = self.anchors.partition_point(|a| a.1 <= row);
+        let (offset, start) = *self.anchors.get(i.checked_sub(1)?)?;
+        Some((offset, row - start))
+    }
+
+    /// Row of a position returned by `locate` (possibly from another layout).
+    pub fn row_of(&self, (offset, delta): (usize, usize)) -> usize {
+        let i = self.anchors.partition_point(|a| a.0 < offset);
+        let anchor = self.anchors.get(i).or(self.anchors.last());
+        anchor.map_or(0, |a| a.1 + delta)
+    }
+
+    /// Add an image with given cell geometry; `prefix` is drawn left of each
+    /// row and `alt` is the text it stands for (used by search).
+    pub fn image(
         &mut self,
-        raster: Raster,
+        raster: Arc<Raster>,
         col: u32,
         cols: u32,
         rows: u32,
@@ -114,7 +140,7 @@ impl Doc {
             id: crate::kitty::next_id(),
             sent: false,
             alt,
-            icon: false,
+            overlay: false,
         });
         for r in 0..rows {
             self.rows.push(Row::Image {
@@ -125,18 +151,18 @@ impl Doc {
         }
     }
 
-    /// Overlay a 1-row icon image at `col` on the existing text row `row`.
-    pub fn icon(&mut self, raster: Raster, row: usize, col: u32, cols: u32) {
+    /// Draw an image over the text rows `row..row + rows`, starting at `col`.
+    pub fn overlay(&mut self, raster: Arc<Raster>, row: usize, col: u32, cols: u32, rows: u32) {
         self.images.push(DocImage {
             raster,
             cols,
-            rows: 1,
+            rows,
             col,
             start: row,
             id: crate::kitty::next_id(),
             sent: false,
             alt: String::new(),
-            icon: true,
+            overlay: true,
         });
     }
 
@@ -322,6 +348,24 @@ mod tests {
         assert_eq!(text(&wrap(&spans, 5)), vec!["abcde", "fghij", "kl"]);
         let spans = vec![Span::plain("a\nb")];
         assert_eq!(text(&wrap(&spans, 5)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn anchors_keep_position() {
+        let mut a = Doc::default();
+        for (offset, rows) in [(0, 3), (40, 5), (90, 2)] {
+            a.anchor(offset);
+            (0..rows).for_each(|_| a.text(Vec::new()));
+        }
+        assert_eq!(a.locate(4), Some((40, 1)));
+        // the same document with two more rows in the first block
+        let mut b = Doc::default();
+        for (offset, rows) in [(0, 5), (40, 5), (90, 2)] {
+            b.anchor(offset);
+            (0..rows).for_each(|_| b.text(Vec::new()));
+        }
+        assert_eq!(b.row_of((40, 1)), 6);
+        assert_eq!(Doc::default().locate(0), None);
     }
 
     #[test]

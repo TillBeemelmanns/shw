@@ -1,6 +1,8 @@
 //! Shared application context and interactive screen handling.
 
+use std::cell::Cell;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -103,16 +105,41 @@ const ENTER: &str = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?
 const LEAVE: &str =
     "\x1b[?7h\x1b[?1007l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
-impl Screen {
-    pub fn enter() -> Result<Screen> {
-        crossterm::terminal::enable_raw_mode()?;
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+static SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static QUIET_PANICS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restore the terminal before a panic message is printed.
+pub fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if QUIET_PANICS.get() {
+            return;
+        }
+        if SCREEN_ACTIVE.load(Ordering::Relaxed) {
             let _ = std::io::stdout().write_all(LEAVE.as_bytes());
             let _ = std::io::stdout().flush();
             let _ = crossterm::terminal::disable_raw_mode();
-            prev(info);
-        }));
+        }
+        prev(info);
+    }));
+}
+
+/// Run `f`, turning a panic into None without touching the terminal. For
+/// third-party code that is fed untrusted input.
+pub fn quiet_panics<T>(f: impl FnOnce() -> T) -> Option<T> {
+    let before = QUIET_PANICS.replace(true);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
+    QUIET_PANICS.set(before);
+    r
+}
+
+impl Screen {
+    pub fn enter() -> Result<Screen> {
+        crossterm::terminal::enable_raw_mode()?;
+        SCREEN_ACTIVE.store(true, Ordering::Relaxed);
         let mut out = std::io::stdout().lock();
         out.write_all(ENTER.as_bytes())?;
         out.flush()?;
@@ -122,6 +149,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        SCREEN_ACTIVE.store(false, Ordering::Relaxed);
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(LEAVE.as_bytes());
         let _ = out.flush();

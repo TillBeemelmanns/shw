@@ -79,6 +79,7 @@ impl Item {
 }
 
 fn main() {
+    app::install_panic_hook();
     if let Err(e) = run() {
         eprintln!("\x1b[1;31mshw:\x1b[0m {}", ui::sanitize(&format!("{e:#}")));
         std::process::exit(1);
@@ -197,7 +198,7 @@ fn load_picture(item: &Item) -> Result<Picture> {
         .parent()
         .filter(|_| !fetch::is_url(&item.src))
         .map(|p| p.to_path_buf());
-    raster::decode((*data).clone(), &item.src, dir.as_deref())
+    raster::decode(&data, &item.src, dir.as_deref())
 }
 
 fn run() -> Result<()> {
@@ -233,6 +234,12 @@ fn run() -> Result<()> {
     let can_probe = (tty_out || cli.doctor) && env.fzf.is_none() && !cli.force;
 
     app::trace("inputs collected");
+    if items
+        .iter()
+        .any(|i| matches!(i.kind, Kind::Markdown | Kind::Code))
+    {
+        code::warm(); // overlaps with probing the terminal
+    }
     let screen = if interactive {
         Some(Screen::enter()?)
     } else {
@@ -339,7 +346,8 @@ struct MdSource {
     title: String,
 }
 
-fn md_opts<'a>(ctx: &'a Ctx, ws: WinSize, width: usize) -> LayoutOpts<'a> {
+/// `wait`: block until downloads have finished (non-interactive output).
+fn md_opts<'a>(ctx: &'a Ctx, ws: WinSize, width: usize, wait: bool) -> LayoutOpts<'a> {
     let (_, ch) = ws.cell();
     LayoutOpts {
         width,
@@ -348,6 +356,7 @@ fn md_opts<'a>(ctx: &'a Ctx, ws: WinSize, width: usize) -> LayoutOpts<'a> {
         text_sizing: ctx.caps.text_sizing && !ctx.kitty.placeholders,
         graphics: ctx.caps.graphics,
         offline: ctx.opts.offline,
+        wait,
         max_img_h: (ws.rows.saturating_sub(3).max(4) as f64) * ch,
         fg: match (ctx.theme.page, ctx.caps.fg) {
             (Some((fg, _)), _) => fg,
@@ -372,10 +381,16 @@ fn md_geometry(cols: u16) -> (usize, u16) {
 impl Source for MdSource {
     fn layout(&mut self, ctx: &Ctx, ws: WinSize) -> Doc {
         let (width, margin) = md_geometry(ws.cols);
-        let mut doc = self.md.layout(&md_opts(ctx, ws, width));
+        let mut doc = self.md.layout(&md_opts(ctx, ws, width, false));
         doc.width = width;
         doc.margin = margin;
         doc
+    }
+    fn poll(&mut self) -> bool {
+        self.md.poll()
+    }
+    fn loading(&self) -> usize {
+        self.md.loading()
     }
     fn badge(&self) -> &str {
         "MD"
@@ -624,7 +639,7 @@ fn run_inline(ctx: &Ctx, items: &[Item], upscale: bool) -> Result<()> {
                     let data = item.bytes()?;
                     let mut md =
                         Markdown::new(String::from_utf8_lossy(&data).into_owned(), item.base());
-                    let mut doc = md.layout(&md_opts(ctx, ws, ws.cols as usize));
+                    let mut doc = md.layout(&md_opts(ctx, ws, ws.cols as usize, true));
                     pager::print_doc(ctx, &mut doc, ws.cols as usize);
                 }
                 Kind::Code => {
@@ -717,7 +732,7 @@ fn doctor(ctx: &Ctx) {
         yes(fetch::which("ffprobe"))
     );
     println!("  ffplay (audio)       {}", yes(fetch::which("ffplay")));
-    println!("  mmdc (mermaid)       {}", yes(fetch::which("mmdc")));
+    println!("  mmdc (mermaid, opt.) {}", yes(fetch::which("mmdc")));
     if !ctx.caps.graphics && ctx.env.known_kitty_terminal() {
         println!("\n  note: this looks like a kitty-compatible terminal but it did not answer; try --force");
     }

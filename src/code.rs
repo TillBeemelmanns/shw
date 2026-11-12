@@ -20,6 +20,15 @@ fn themes() -> &'static ThemeSet {
     T.get_or_init(ThemeSet::load_defaults)
 }
 
+/// Load the grammars and themes in the background, so that they are ready
+/// by the time the first document is laid out.
+pub fn warm() {
+    std::thread::spawn(|| {
+        syntaxes();
+        themes();
+    });
+}
+
 /// Resolve a fenced-code language token or file name to a syntax.
 pub fn find_syntax(token: &str) -> Option<&'static SyntaxReference> {
     let ss = syntaxes();

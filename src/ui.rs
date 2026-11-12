@@ -1,8 +1,8 @@
 //! Colours, styled text spans and status bar rendering.
 
 use std::borrow::Cow;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -122,7 +122,7 @@ pub struct Style {
     pub underline: bool,
     pub strike: bool,
     pub dim: bool,
-    pub link: Option<Rc<str>>,
+    pub link: Option<Arc<str>>,
 }
 
 impl Style {

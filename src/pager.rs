@@ -9,7 +9,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
 use crate::app::{
     is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS, MOUSE_TO_APP, MOUSE_TO_TERMINAL,
 };
-use crate::doc::{render_text, Doc, Row};
+use crate::doc::{render_text, Doc, DocImage, Row};
 use crate::kitty::placeholder_row;
 use crate::term::WinSize;
 use crate::ui::{
@@ -18,6 +18,15 @@ use crate::ui::{
 
 pub trait Source {
     fn layout(&mut self, ctx: &Ctx, ws: WinSize) -> Doc;
+    /// True if content loaded in the background has arrived since the last
+    /// layout: the document should be laid out again.
+    fn poll(&mut self) -> bool {
+        false
+    }
+    /// Number of things still loading in the background.
+    fn loading(&self) -> usize {
+        0
+    }
     fn badge(&self) -> &str;
     fn title(&self) -> String;
 }
@@ -59,12 +68,81 @@ fn free_images(ctx: &Ctx, doc: &mut Doc, out: &mut Vec<u8>) {
     }
 }
 
+/// Transmit the image data unless the terminal already has it.
+fn send_image(ctx: &Ctx, out: &mut Vec<u8>, im: &mut DocImage) {
+    if im.sent {
+        return;
+    }
+    let control = if ctx.kitty.placeholders {
+        format!("a=T,U=1,i={},c={},r={}", im.id, im.cols, im.rows)
+    } else {
+        format!("a=t,i={}", im.id)
+    };
+    ctx.kitty.transmit(out, &im.raster, &control);
+    im.sent = true;
+}
+
+/// Show the image from its row `row` on, at screen row `r` (0-based) of a
+/// view with left margin `m`, cropped to the `room` rows left on screen.
+fn place_image(
+    ctx: &Ctx,
+    out: &mut Vec<u8>,
+    im: &mut DocImage,
+    (r, m): (usize, usize),
+    row: u32,
+    room: usize,
+    ch: f64,
+) {
+    send_image(ctx, out, im);
+    let col = im.col as usize + m + 1;
+    let vis_rows = (im.rows - row).min(room as u32);
+    if ctx.kitty.placeholders {
+        for k in 0..vis_rows {
+            let cells = placeholder_row(im.id, row + k, im.cols);
+            out.extend_from_slice(format!("\x1b[{};{col}H{cells}", r + k as usize + 1).as_bytes());
+        }
+        return;
+    }
+    let y = ((row as f64 * ch).round() as u32).min(im.raster.h.saturating_sub(1));
+    let y_end = (((row + vis_rows) as f64) * ch)
+        .round()
+        .min(im.raster.h as f64) as u32;
+    let h = y_end.saturating_sub(y).max(1);
+    // same placement id: the terminal moves/re-crops the existing placement
+    let s = format!(
+        "\x1b[{};{col}H\x1b_Ga=p,i={},p=1,x=0,y={y},w={},h={h},C=1,q=2\x1b\\",
+        r + 1,
+        im.id,
+        im.raster.w
+    );
+    if ctx.kitty.tmux {
+        out.extend_from_slice(crate::kitty::tmux_wrap(&s).as_bytes());
+    } else {
+        out.extend_from_slice(s.as_bytes());
+    }
+}
+
+/// Lay the document out again (new size, theme or content) and keep the
+/// reading position. The old images are freed with the next frame.
+fn relayout(ctx: &Ctx, src: &mut dyn Source, doc: &mut Doc, st: &mut State, ws: WinSize) {
+    free_images(ctx, doc, &mut st.stale);
+    let position = doc.locate(st.top);
+    let fraction = st.top as f64 / doc.rows.len().max(1) as f64;
+    *doc = src.layout(ctx, ws);
+    st.top = match position {
+        Some(p) => doc.row_of(p),
+        None => (fraction * doc.rows.len() as f64) as usize,
+    };
+}
+
 struct State {
     top: usize,
     search: Option<String>,
     input: Option<String>,
     message: Option<String>,
     help: bool,
+    /// Escape sequences that free the images of a replaced layout.
+    stale: Vec<u8>,
 }
 
 pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> {
@@ -85,6 +163,7 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
         input: None,
         message: None,
         help: false,
+        stale: Vec::new(),
     };
     let mut dirty = true;
     let nav = loop {
@@ -92,13 +171,22 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
         let max_top = doc.rows.len().saturating_sub(view);
         st.top = st.top.min(max_top);
         if dirty {
-            draw(ctx, &mut doc, &st, ws, src, pos);
+            draw(ctx, &mut doc, &mut st, ws, src, pos);
             if std::mem::take(&mut first_draw) {
                 crate::app::trace("first frame drawn");
             }
             dirty = false;
         }
-        let evs = read_events(Duration::from_secs(3600))?;
+        // while pictures load in the background, look for them regularly
+        let timeout = match src.loading() {
+            0 => Duration::from_secs(3600),
+            _ => Duration::from_millis(40),
+        };
+        let evs = read_events(timeout)?;
+        if src.poll() {
+            relayout(ctx, src, &mut doc, &mut st, ws);
+            dirty = true;
+        }
         let mut nav = None;
         for ev in evs {
             dirty = true;
@@ -131,13 +219,8 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
             st.message = None;
             match ev {
                 Event::Resize(..) => {
-                    let mut out = Vec::new();
-                    free_images(ctx, &mut doc, &mut out);
-                    ctx.write(&out);
-                    let frac = st.top as f64 / doc.rows.len().max(1) as f64;
                     ws = ctx.size();
-                    doc = src.layout(ctx, ws);
-                    st.top = (frac * doc.rows.len() as f64) as usize;
+                    relayout(ctx, src, &mut doc, &mut st, ws);
                 }
                 Event::Mouse(m) => match m.kind {
                     MouseEventKind::ScrollDown => st.top = (st.top + 3).min(max_top),
@@ -181,12 +264,7 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
                             let dark = !ctx.theme.dark;
                             set_theme_override(dark);
                             ctx.theme = Theme::for_bg(dark, ctx.caps.dark);
-                            let mut out = Vec::new();
-                            free_images(ctx, &mut doc, &mut out);
-                            ctx.write(&out);
-                            let top = st.top;
-                            doc = src.layout(ctx, ws);
-                            st.top = top;
+                            relayout(ctx, src, &mut doc, &mut st, ws);
                             st.message = Some(if dark {
                                 "dark theme".into()
                             } else {
@@ -248,7 +326,14 @@ fn find(doc: &Doc, st: &mut State, forward: bool, include_current: bool) {
     st.message = Some(format!("Pattern not found: {q}"));
 }
 
-fn draw(ctx: &Ctx, doc: &mut Doc, st: &State, ws: WinSize, src: &dyn Source, pos: (usize, usize)) {
+fn draw(
+    ctx: &Ctx,
+    doc: &mut Doc,
+    st: &mut State,
+    ws: WinSize,
+    src: &dyn Source,
+    pos: (usize, usize),
+) {
     let t = &ctx.theme;
     let (_, ch) = ws.cell();
     let view = ws.rows.saturating_sub(CHROME_ROWS).max(1) as usize;
@@ -261,6 +346,7 @@ fn draw(ctx: &Ctx, doc: &mut Doc, st: &State, ws: WinSize, src: &dyn Source, pos
     let page = t.page;
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     out.extend_from_slice(b"\x1b[?2026h\x1b[0m");
+    out.append(&mut st.stale);
     if st.help {
         // the help screen clears the display: drop images, they are re-sent afterwards
         free_images(ctx, doc, &mut out);
@@ -322,92 +408,19 @@ fn draw(ctx: &Ctx, doc: &mut Doc, st: &State, ws: WinSize, src: &dyn Source, pos
                 write_spans(&mut line, prefix, 1, None, page);
                 out.extend_from_slice(line.as_bytes());
                 let im = &mut doc.images[img];
-                if ctx.kitty.placeholders {
-                    if !im.sent {
-                        ctx.kitty.transmit(
-                            &mut out,
-                            &im.raster,
-                            &format!("a=T,U=1,i={},c={},r={}", im.id, im.cols, im.rows),
-                        );
-                        im.sent = true;
-                    }
-                    let s = format!(
-                        "\x1b[{};{}H{}",
-                        r + 1,
-                        im.col as usize + m + 1,
-                        placeholder_row(im.id, row, im.cols)
-                    );
-                    out.extend_from_slice(s.as_bytes());
-                } else if i == im.start.max(st.top) {
-                    if !im.sent {
-                        ctx.kitty
-                            .transmit(&mut out, &im.raster, &format!("a=t,i={}", im.id));
-                        im.sent = true;
-                    }
-                    let vis_rows = (im.rows - row).min((view - r) as u32);
-                    let y = ((row as f64 * ch).round() as u32).min(im.raster.h.saturating_sub(1));
-                    let y_end = (((row + vis_rows) as f64) * ch)
-                        .round()
-                        .min(im.raster.h as f64) as u32;
-                    let h = y_end.saturating_sub(y).max(1);
-                    // same placement id: the terminal moves/re-crops the existing placement
-                    let s = format!(
-                        "\x1b[{};{}H\x1b_Ga=p,i={},p=1,x=0,y={y},w={},h={h},C=1,q=2\x1b\\",
-                        r + 1,
-                        im.col as usize + m + 1,
-                        im.id,
-                        im.raster.w
-                    );
-                    if ctx.kitty.tmux {
-                        out.extend_from_slice(crate::kitty::tmux_wrap(&s).as_bytes());
-                    } else {
-                        out.extend_from_slice(s.as_bytes());
-                    }
+                if i == im.start.max(st.top) {
+                    place_image(ctx, &mut out, im, (r, m), row, view - r, ch);
                 }
             }
         }
     }
 
-    // Icons (task list checkboxes) are drawn over their text row.
-    for im in doc.images.iter_mut().filter(|im| im.icon) {
-        if im.start < st.top || im.start >= st.top + view {
-            continue;
-        }
-        let r = im.start - st.top;
-        let col = im.col as usize + m + 1;
-        if ctx.kitty.placeholders {
-            if !im.sent {
-                ctx.kitty.transmit(
-                    &mut out,
-                    &im.raster,
-                    &format!("a=T,U=1,i={},c={},r=1", im.id, im.cols),
-                );
-                im.sent = true;
-            }
-            out.extend_from_slice(
-                format!(
-                    "\x1b[{};{col}H{}",
-                    r + 1,
-                    placeholder_row(im.id, 0, im.cols)
-                )
-                .as_bytes(),
-            );
-        } else {
-            if !im.sent {
-                ctx.kitty
-                    .transmit(&mut out, &im.raster, &format!("a=t,i={}", im.id));
-                im.sent = true;
-            }
-            let s = format!(
-                "\x1b[{};{col}H\x1b_Ga=p,i={},p=1,C=1,q=2\x1b\\",
-                r + 1,
-                im.id
-            );
-            if ctx.kitty.tmux {
-                out.extend_from_slice(crate::kitty::tmux_wrap(&s).as_bytes());
-            } else {
-                out.extend_from_slice(s.as_bytes());
-            }
+    // Overlays (checkboxes, pictures in table cells) are drawn over their text rows.
+    for im in doc.images.iter_mut().filter(|im| im.overlay) {
+        let first = im.start.max(top);
+        if first < bottom && first < im.start + im.rows as usize {
+            let (r, row) = (first - top, (first - im.start) as u32);
+            place_image(ctx, &mut out, im, (r, m), row, view - r, ch);
         }
     }
 
@@ -425,7 +438,15 @@ fn draw(ctx: &Ctx, doc: &mut Doc, st: &State, ws: WinSize, src: &dyn Source, pos
     } else {
         format!("{}{}", src.title(), pos_label(pos))
     };
-    let right = format!("{}/{}  {pct}%", (st.top + 1).min(total.max(1)), total);
+    let loading = match src.loading() {
+        0 => String::new(),
+        n => format!("loading {n} image{}…  ", if n == 1 { "" } else { "s" }),
+    };
+    let right = format!(
+        "{loading}{}/{}  {pct}%",
+        (st.top + 1).min(total.max(1)),
+        total
+    );
     out.extend_from_slice(
         status_bar(t, ws.rows - 1, ws.cols, src.badge(), &left, &right).as_bytes(),
     );
@@ -446,20 +467,28 @@ pub fn print_doc(ctx: &Ctx, doc: &mut Doc, width: usize) {
             Row::Text { spans, fill, scale } => {
                 render_text(&mut line, spans, *fill, *scale, width, None, None);
                 out.extend_from_slice(line.as_bytes());
-                for im in doc.images.iter_mut().filter(|im| im.icon && im.start == i) {
+                // overlays: placeholder cells row by row; otherwise the image is
+                // drawn from its last row, once the rows it covers exist
+                let over = |im: &&mut DocImage| {
+                    im.overlay && (im.start..im.start + im.rows as usize).contains(&i)
+                };
+                for im in doc.images.iter_mut().filter(over) {
+                    let row = (i - im.start) as u32;
                     out.extend_from_slice(format!("\x1b[{}G", im.col + 1).as_bytes());
                     if ctx.kitty.placeholders {
-                        ctx.kitty.transmit(
-                            &mut out,
-                            &im.raster,
-                            &format!("a=T,U=1,i={},c={},r=1", im.id, im.cols),
-                        );
-                        out.extend_from_slice(placeholder_row(im.id, 0, im.cols).as_bytes());
-                    } else {
+                        send_image(ctx, &mut out, im);
+                        out.extend_from_slice(placeholder_row(im.id, row, im.cols).as_bytes());
+                    } else if row + 1 == im.rows {
+                        if row > 0 {
+                            out.extend_from_slice(format!("\x1b[{row}A").as_bytes());
+                        }
                         ctx.kitty
                             .transmit(&mut out, &im.raster, &format!("a=T,i={},C=1", im.id));
+                        if row > 0 {
+                            out.extend_from_slice(format!("\x1b[{row}B").as_bytes());
+                        }
+                        im.sent = true;
                     }
-                    im.sent = true;
                 }
                 out.push(b'\n');
             }

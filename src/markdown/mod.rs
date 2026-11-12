@@ -1,12 +1,15 @@
 //! GitHub-flavoured Markdown renderer: typography, tables, alerts, task lists,
-//! emoji shortcodes, syntax highlighted code, images (local, remote, SVG,
-//! HTML `<img>`), mermaid diagrams (via `mmdc`) and clickable links.
+//! footnotes, emoji shortcodes, syntax highlighted code, images (local, remote,
+//! SVG, HTML `<img>`), diagrams (mermaid, GeoJSON, TopoJSON, STL) and
+//! clickable links.
 
+mod assets;
+mod diagram;
 mod html;
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use pulldown_cmark::{
@@ -19,6 +22,7 @@ use crate::doc::{hard_wrap, wrap, Doc, Row};
 use crate::fetch;
 use crate::raster::{compose_row, Picture, Raster};
 use crate::ui::{spans_width, Rgb, Span, Style, Theme};
+use assets::{diagram_key, Assets, Job};
 use html::Token;
 
 /// Where relative links and images are resolved from.
@@ -35,50 +39,82 @@ pub struct LayoutOpts<'a> {
     pub text_sizing: bool,
     pub graphics: bool,
     pub offline: bool,
+    /// Wait for downloads instead of showing the document without them first.
+    pub wait: bool,
     /// Maximum image height in pixels.
     pub max_img_h: f64,
     /// Text colour used for typeset (image) headings.
     pub fg: Rgb,
 }
 
-type Cache = HashMap<String, Option<Arc<Picture>>>;
-
 pub struct Markdown {
     src: String,
     base: Base,
-    cache: Cache,
+    assets: Assets,
+}
+
+/// First word of a fenced code block's info string.
+fn fence_lang(info: &str) -> &str {
+    info.split([' ', ',', '{']).next().unwrap_or("")
 }
 
 impl Markdown {
     pub fn new(src: String, base: Base) -> Self {
-        crate::raster::warm_fonts();
         Markdown {
             src,
             base,
-            cache: HashMap::new(),
+            assets: Assets::default(),
         }
     }
 
-    fn options() -> Options {
-        Options::ENABLE_TABLES
-            | Options::ENABLE_FOOTNOTES
-            | Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_GFM
-            | Options::ENABLE_MATH
-            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+    /// True once pictures loaded in the background have arrived: lay out again.
+    pub fn poll(&mut self) -> bool {
+        self.assets.poll()
+    }
+
+    /// Number of pictures still loading in the background.
+    pub fn loading(&self) -> usize {
+        self.assets.loading()
     }
 
     pub fn layout(&mut self, o: &LayoutOpts) -> Doc {
-        let events: Vec<Event> = Parser::new_ext(&self.src, Self::options()).collect();
+        let (events, footnotes) = parse(&self.src);
         crate::app::trace("markdown parsed");
-        if o.graphics {
-            preload(&events, &self.base, &mut self.cache, o);
-            crate::app::trace("images loaded");
-        }
-        let mut r = Renderer::new(o, &self.cache, &self.base);
-        for ev in events {
+        self.assets.validate(format!(
+            "{} {:?} {} {:?}",
+            o.width, o.cell, o.theme.dark, o.fg
+        ));
+        // Highlight the code blocks on other threads while the pictures load:
+        // compiling a grammar on first use takes tens of milliseconds.
+        let assets = &mut self.assets;
+        let code: Vec<(u64, &str, String)> = code_blocks(&events)
+            .into_iter()
+            .filter(|b| !assets.code.contains_key(&b.0))
+            .collect();
+        std::thread::scope(|s| {
+            let highlight = |(key, lang, text): &(u64, &str, String)| {
+                let lines = code::highlight(text, code::find_syntax(lang), o.theme, 5000);
+                (*key, Arc::new(lines))
+            };
+            let chunks = code.chunks(code.len().div_ceil(8).max(1));
+            let threads: Vec<_> = chunks
+                .map(|c| s.spawn(move || c.iter().map(highlight).collect::<Vec<_>>()))
+                .collect();
+            if o.graphics {
+                assets.load(jobs(&events, &self.base, o), o.wait);
+            }
+            for t in threads {
+                assets.code.extend(t.join().unwrap_or_default());
+            }
+        });
+        crate::app::trace("pictures loaded, code highlighted");
+        let mut r = Renderer::new(o, &mut self.assets, &self.base, footnotes);
+        for (ev, offset) in events {
+            let block_start = matches!(ev, Event::Start(_));
             r.event(ev);
+            if block_start {
+                r.doc.anchor(offset);
+            }
         }
         let doc = r.finish();
         crate::app::trace(format!(
@@ -90,8 +126,53 @@ impl Markdown {
     }
 }
 
+/// Parse into events with their source offsets. Footnote definitions move
+/// to the end, as on GitHub; also returns each footnote's number.
+fn parse(src: &str) -> (Vec<(Event<'_>, usize)>, HashMap<String, usize>) {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM
+        | Options::ENABLE_MATH
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+    let mut body = Vec::new();
+    let mut notes: Vec<(String, Vec<(Event, usize)>)> = Vec::new();
+    let mut numbers = HashMap::new();
+    let mut in_note = false;
+    for (ev, range) in Parser::new_ext(src, options).into_offset_iter() {
+        match &ev {
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                in_note = true;
+                notes.push((label.to_string(), Vec::new()));
+            }
+            Event::FootnoteReference(label) => {
+                let n = numbers.len() + 1;
+                numbers.entry(label.to_string()).or_insert(n);
+            }
+            _ => {}
+        }
+        let end = matches!(ev, Event::End(TagEnd::FootnoteDefinition));
+        match notes.last_mut() {
+            Some(note) if in_note => note.1.push((ev, range.start)),
+            _ => body.push((ev, range.start)),
+        }
+        in_note &= !end;
+    }
+    if !notes.is_empty() {
+        for (label, _) in &notes {
+            let n = numbers.len() + 1;
+            numbers.entry(label.clone()).or_insert(n);
+        }
+        notes.sort_by_key(|(label, _)| numbers[label]);
+        body.push((Event::Rule, src.len()));
+        body.extend(notes.into_iter().flat_map(|n| n.1));
+    }
+    (body, numbers)
+}
+
 // ---------------------------------------------------------------------------
-// Image loading
+// Links and image sources
 
 fn resolve(base: &Base, src: &str) -> Option<String> {
     let src = src.trim();
@@ -146,7 +227,7 @@ const SAFE_LINK_EXT: &[&str] = &[
 /// Target for a clickable (OSC 8) link, or None if it should not be clickable.
 /// Only http(s) and mailto URLs and harmless local file types are allowed;
 /// other schemes (`javascript:`, custom app schemes, `file:` to scripts) are dropped.
-fn link_target(base: &Base, url: &str) -> Option<Rc<str>> {
+fn link_target(base: &Base, url: &str) -> Option<Arc<str>> {
     let url = url.trim();
     if url.starts_with('#') || url.is_empty() || url.chars().any(char::is_control) {
         return None;
@@ -181,148 +262,86 @@ fn link_target(base: &Base, url: &str) -> Option<Rc<str>> {
     Some(format!("file://{abs}").into())
 }
 
-fn mermaid_key(src: &str) -> String {
-    use std::hash::{Hash, Hasher};
+fn code_key(lang: &str, text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    src.hash(&mut h);
-    format!("mermaid:{:x}", h.finish())
+    (lang, text).hash(&mut h);
+    h.finish()
 }
 
-fn render_mermaid(src: &str, dark: bool) -> Option<Picture> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mmdc = fetch::tool("mmdc")?;
-    // private, unpredictable working directory, always removed afterwards
-    let dir = std::env::temp_dir().join(format!("shw-mermaid-{}", crate::kitty::random_hex(12)));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
-    let result = render_mermaid_in(&mmdc, &dir, src, dark);
-    let _ = std::fs::remove_dir_all(&dir);
-    result
-}
-
-fn render_mermaid_in(mmdc: &Path, dir: &Path, src: &str, dark: bool) -> Option<Picture> {
-    let input = dir.join("diagram.mmd");
-    let output = dir.join("diagram.png");
-    crate::kitty::write_private_new(&input, src.as_bytes()).ok()?;
-    // Run inside the private directory: Puppeteer (used by mmdc) loads config
-    // files such as .puppeteerrc.cjs from the working directory.
-    let status = std::process::Command::new(mmdc)
-        .current_dir(dir)
-        .arg("-i")
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .args([
-            "-b",
-            "transparent",
-            "-s",
-            "2",
-            "-q",
-            "-t",
-            if dark { "dark" } else { "default" },
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let data = std::fs::read(&output).ok();
-    if !status.ok()?.success() {
-        return None;
-    }
-    let mut pic = crate::raster::decode(data?, "diagram.png", None).ok()?;
-    // rendered at scale 2: report CSS size
-    pic.width = (pic.width / 2).max(1);
-    pic.height = (pic.height / 2).max(1);
-    Some(pic)
-}
-
-/// Collect every image referenced by the document and load the missing ones in parallel.
-fn preload(events: &[Event], base: &Base, cache: &mut Cache, o: &LayoutOpts) {
-    let mut wanted: Vec<String> = Vec::new();
-    let mut mermaid: Vec<String> = Vec::new();
-    let mut in_mermaid: Option<String> = None;
-    for ev in events {
+/// The code blocks to highlight: (cache key, language, text).
+fn code_blocks<'a>(events: &'a [(Event, usize)]) -> Vec<(u64, &'a str, String)> {
+    let mut out = Vec::new();
+    let mut block: Option<(&str, String)> = None;
+    for (ev, _) in events {
         match ev {
-            Event::Start(Tag::Image { dest_url, .. }) => {
-                if let Some(k) = resolve(base, dest_url) {
-                    wanted.push(k);
-                }
-            }
-            Event::Html(h) | Event::InlineHtml(h) => {
-                for t in html::tokenize(h) {
-                    if let Token::Open { name, attrs, .. } = t {
-                        if name == "img" {
-                            if let Some(k) =
-                                Token::attr(&attrs, "src").and_then(|s| resolve(base, s))
-                            {
-                                wanted.push(k);
-                            }
-                        }
-                    }
-                }
-            }
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang)))
-                if lang.split_whitespace().next() == Some("mermaid") =>
-            {
-                in_mermaid = Some(String::new());
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let lang = match kind {
+                    CodeBlockKind::Fenced(info) => fence_lang(info),
+                    CodeBlockKind::Indented => "",
+                };
+                block = (!diagram::is_diagram(lang)).then_some((lang, String::new()));
             }
             Event::Text(t) => {
-                if let Some(m) = &mut in_mermaid {
-                    m.push_str(t);
+                if let Some((_, text)) = &mut block {
+                    text.push_str(t);
                 }
             }
             Event::End(TagEnd::CodeBlock) => {
-                if let Some(m) = in_mermaid.take() {
-                    mermaid.push(m);
+                if let Some((lang, mut text)) = block.take() {
+                    text.truncate(text.strip_suffix('\n').unwrap_or(&text).len());
+                    out.push((code_key(lang, &text), lang, text));
                 }
             }
             _ => {}
         }
     }
-    wanted.retain(|k| !cache.contains_key(k) && !(o.offline && fetch::is_url(k)));
-    wanted.sort();
-    wanted.dedup();
-    let have_mmdc = !mermaid.is_empty() && fetch::which("mmdc");
-    mermaid.retain(|m| !cache.contains_key(&mermaid_key(m)));
-    if !have_mmdc {
-        for m in &mermaid {
-            cache.insert(mermaid_key(m), None);
-        }
-        mermaid.clear();
-    }
+    out
+}
 
-    let dark = o.theme.dark;
-    let results: Vec<(String, Option<Arc<Picture>>)> = std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        for chunk in wanted.chunks(wanted.len().div_ceil(16).max(1)) {
-            handles.push(s.spawn(move || {
-                chunk
-                    .iter()
-                    .map(|k| {
-                        let data = if fetch::is_url(k) {
-                            fetch::fetch_untrusted(k)
-                        } else {
-                            fetch::read_source(k)
-                        };
-                        let pic = data.ok().and_then(|data| {
-                            let dir = Path::new(k).parent().filter(|_| !fetch::is_url(k));
-                            crate::raster::decode(data, k, dir).ok()
-                        });
-                        (k.clone(), pic.map(Arc::new))
-                    })
-                    .collect::<Vec<_>>()
-            }));
+/// Every picture the document refers to: images and diagram code blocks.
+fn jobs(events: &[(Event, usize)], base: &Base, o: &LayoutOpts) -> Vec<Job> {
+    let mut jobs = Vec::new();
+    let image = |src: &str| {
+        resolve(base, src)
+            .filter(|k| !(o.offline && fetch::is_url(k)))
+            .map(Job::Image)
+    };
+    let mut diagram: Option<(&str, String)> = None;
+    for (ev, _) in events {
+        match ev {
+            Event::Start(Tag::Image { dest_url, .. }) => jobs.extend(image(dest_url)),
+            Event::Html(h) | Event::InlineHtml(h) => {
+                for t in html::tokenize(h) {
+                    if let Token::Open { name, attrs, .. } = t {
+                        if name == "img" {
+                            jobs.extend(Token::attr(&attrs, "src").and_then(image));
+                        }
+                    }
+                }
+            }
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if diagram::is_diagram(fence_lang(info)) =>
+            {
+                diagram = Some((fence_lang(info), String::new()));
+            }
+            Event::Text(t) => {
+                if let Some((_, src)) = &mut diagram {
+                    src.push_str(t);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((lang, src)) = diagram.take() {
+                    jobs.push(Job::Diagram {
+                        lang: lang.to_string(),
+                        src,
+                        dark: o.theme.dark,
+                    });
+                }
+            }
+            _ => {}
         }
-        for m in &mermaid {
-            handles.push(
-                s.spawn(move || vec![(mermaid_key(m), render_mermaid(m, dark).map(Arc::new))]),
-            );
-        }
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
-    cache.extend(results);
+    }
+    jobs
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +372,7 @@ struct ImgRef {
     alt: String,
     width: Option<Dim>,
     height: Option<Dim>,
-    link: Option<Rc<str>>,
+    link: Option<Arc<str>>,
 }
 
 enum Inline {
@@ -367,24 +386,38 @@ enum Block {
     Item { marker: Option<Span>, indent: usize },
 }
 
+/// A table cell: text, and pictures shown in a row above or below it.
+#[derive(Default)]
+struct Cell {
+    text: Vec<Span>,
+    images: Vec<(String, Arc<Picture>, ImgRef)>,
+    images_first: bool,
+}
+
+/// A laid-out cell: wrapped text lines, the picture with its size in cells
+/// (columns, rows), and whether the picture comes first.
+type CellLayout = (Vec<Vec<Span>>, Option<Arc<Raster>>, usize, usize, bool);
+
 struct Table {
     aligns: Vec<Alignment>,
-    rows: Vec<Vec<Vec<Span>>>,
-    cur: Vec<Vec<Span>>,
+    rows: Vec<Vec<Cell>>,
+    cur: Vec<Cell>,
     header_rows: usize,
 }
 
 struct Renderer<'a> {
     o: &'a LayoutOpts<'a>,
     t: &'a Theme,
-    cache: &'a Cache,
+    assets: &'a mut Assets,
     base: &'a Base,
+    /// Footnote label -> number.
+    footnotes: HashMap<String, usize>,
     doc: Doc,
     blocks: Vec<Block>,
     inline: Vec<Inline>,
     styles: Vec<Style>,
     html_styles: Vec<String>,
-    links: Vec<Option<Rc<str>>>,
+    links: Vec<Option<Arc<str>>>,
     heading: Option<u8>,
     code: Option<(String, String)>,
     table: Option<Table>,
@@ -395,15 +428,23 @@ struct Renderer<'a> {
     no_gap: bool,
     /// Task list checkboxes to draw as icons: (row, column, checked).
     checkboxes: Vec<(usize, u32, bool)>,
+    /// Open HTML `<dd>` elements (each one is an indented block).
+    html_dd: usize,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(o: &'a LayoutOpts<'a>, cache: &'a Cache, base: &'a Base) -> Self {
+    fn new(
+        o: &'a LayoutOpts<'a>,
+        assets: &'a mut Assets,
+        base: &'a Base,
+        footnotes: HashMap<String, usize>,
+    ) -> Self {
         Renderer {
             o,
             t: o.theme,
-            cache,
+            assets,
             base,
+            footnotes,
             doc: Doc::default(),
             blocks: Vec::new(),
             inline: Vec::new(),
@@ -418,6 +459,7 @@ impl<'a> Renderer<'a> {
             center: Vec::new(),
             no_gap: false,
             checkboxes: Vec::new(),
+            html_dd: 0,
         }
     }
 
@@ -449,7 +491,6 @@ impl<'a> Renderer<'a> {
     /// innermost pending list marker is emitted (once).
     fn prefix(&mut self, consume: bool) -> Vec<Span> {
         let mut out = Vec::new();
-        let border = self.t.border;
         for b in self.blocks.iter_mut() {
             match b {
                 Block::Quote { color } => out.push(Span::new("▎ ", Style::fg(*color))),
@@ -476,7 +517,6 @@ impl<'a> Renderer<'a> {
                 Block::List { .. } => {}
             }
         }
-        let _ = border;
         out
     }
 
@@ -525,13 +565,21 @@ impl<'a> Renderer<'a> {
             buf.push_str(text);
             return;
         }
-        let text = if self.in_code_span {
-            text.to_string()
-        } else {
-            emojify(text)
-        };
         let st = self.style();
-        self.inline.push(Inline::Text(Span::new(text, st)));
+        if self.in_code_span {
+            self.inline.push(Inline::Text(Span::new(text, st)));
+            return;
+        }
+        // bare URLs become links, like GitHub's autolinks
+        let linkify = self.links.is_empty();
+        for (part, url) in autolinks(text, linkify) {
+            let mut st = st.clone();
+            if let Some(target) = url.and_then(|u| link_target(self.base, &u)) {
+                st.fg = Some(self.t.link);
+                st.link = Some(target);
+            }
+            self.inline.push(Inline::Text(Span::new(emojify(part), st)));
+        }
     }
 
     fn event(&mut self, ev: Event) {
@@ -571,8 +619,11 @@ impl<'a> Renderer<'a> {
             Event::Html(h) | Event::InlineHtml(h) => self.html(&h),
             Event::FootnoteReference(label) => {
                 let link = self.t.link;
+                let n = self.footnotes.get(&*label).copied().unwrap_or(0);
                 self.push_style(|s| s.fg = Some(link));
-                self.push_text(&superscript(&label));
+                self.in_code_span = true; // literal text
+                self.push_text(&superscript(n));
+                self.in_code_span = false;
                 self.pop_style();
             }
             Event::SoftBreak => self.push_text(" "),
@@ -654,9 +705,7 @@ impl<'a> Renderer<'a> {
                 self.flush_inline();
                 self.block_gap();
                 let lang = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split([' ', ',', '{']).next().unwrap_or("").to_string()
-                    }
+                    CodeBlockKind::Fenced(info) => fence_lang(&info).to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
                 self.code = Some((lang, String::new()));
@@ -698,7 +747,7 @@ impl<'a> Renderer<'a> {
             Tag::FootnoteDefinition(label) => {
                 self.flush_inline();
                 self.block_gap();
-                let m = format!("{}. ", label);
+                let m = format!("{}. ", self.footnotes.get(&*label).copied().unwrap_or(0));
                 let w = m.width();
                 self.blocks.push(Block::Item {
                     marker: Some(Span::new(m, Style::fg(self.t.muted))),
@@ -807,18 +856,25 @@ impl<'a> Renderer<'a> {
                 }
             }
             TagEnd::TableCell => {
-                let items = std::mem::take(&mut self.inline);
-                let spans: Vec<Span> = items
-                    .into_iter()
-                    .map(|i| match i {
-                        Inline::Text(s) => s,
+                let mut cell = Cell::default();
+                for item in std::mem::take(&mut self.inline) {
+                    match item {
+                        Inline::Text(s) => cell.text.push(s),
                         Inline::Img(r) => {
-                            Span::new(format!("🖼 {}", r.alt), Style::fg(self.t.muted))
+                            let key = r.key.clone().filter(|_| self.o.graphics);
+                            match key.and_then(|k| Some((self.assets.get(&k)?, k))) {
+                                Some((pic, key)) => {
+                                    cell.images_first |= cell.text.is_empty();
+                                    cell.images.push((key, pic, r));
+                                }
+                                // not loaded (yet): the alt text stands in
+                                None => cell.text.push(self.alt_span(&r)),
+                            }
                         }
-                    })
-                    .collect();
+                    }
+                }
                 if let Some(t) = &mut self.table {
-                    t.cur.push(spans);
+                    t.cur.push(cell);
                 }
             }
             TagEnd::Emphasis
@@ -919,45 +975,26 @@ impl<'a> Renderer<'a> {
         let cw = self.content_width();
         let avail = cw as f64 * cw_px - 2.0;
 
-        // greedy word wrap by measured width
-        let mut lines: Vec<String> = Vec::new();
-        let mut cur = String::new();
-        for word in text.split(' ') {
-            let cand = if cur.is_empty() {
-                word.to_string()
-            } else {
-                format!("{cur} {word}")
-            };
-            match crate::raster::text_width(&cand, size) {
-                None => return false,
-                Some(w) if w > avail && !cur.is_empty() => {
-                    lines.push(std::mem::replace(&mut cur, word.to_string()));
-                }
-                _ => cur = cand,
-            }
-        }
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
         let color = (self.o.fg.0, self.o.fg.1, self.o.fg.2);
-        let mut rendered = Vec::new();
-        for l in &lines {
-            match crate::raster::render_text_line(l, size, h, color) {
-                Some(r) => rendered.push((r, l.clone())),
-                None => return false,
+        let key = format!("{level} {cw} {text}");
+        let lines = match self.assets.headings.get(&key) {
+            Some(lines) => lines.clone(),
+            None => {
+                let lines = crate::raster::typeset(&text, size, h, avail, color).map(|lines| {
+                    Arc::new(lines.into_iter().map(|(r, t)| (Arc::new(r), t)).collect())
+                });
+                self.assets.headings.insert(key, lines.clone());
+                lines
             }
-        }
-        for (raster, alt) in rendered {
+        };
+        let Some(lines) = lines else {
+            return false;
+        };
+        for (raster, alt) in lines.iter() {
             let cols = ((raster.w as f64 / cw_px).ceil() as u32)
                 .min(cw as u32)
                 .max(1);
-            let mut col = self.prefix_width() as u32;
-            if self.centered() && cols < cw as u32 {
-                col += (cw as u32 - cols) / 2;
-            }
-            let p = self.prefix(true);
-            let prefix: Vec<Span> = p.into_iter().filter(|s| s.text.contains('▎')).collect();
-            self.doc.image_alt(raster, col, cols, rows, prefix, alt);
+            self.place(raster.clone(), cols, rows, alt.clone());
         }
         if level <= 2 {
             let mut p = self.prefix(false);
@@ -965,6 +1002,22 @@ impl<'a> Renderer<'a> {
             self.doc.text(p);
         }
         true
+    }
+
+    /// Put an image on its own rows, centred if the context asks for it.
+    fn place(&mut self, raster: Arc<Raster>, cols: u32, rows: u32, alt: String) {
+        let cw = self.content_width() as u32;
+        let mut col = self.prefix_width() as u32;
+        if self.centered() && cols < cw {
+            col += (cw - cols) / 2;
+        }
+        // keep quote bars, drop list markers for image rows
+        let prefix = self.prefix(true);
+        let prefix = prefix
+            .into_iter()
+            .filter(|s| s.text.contains('▎'))
+            .collect();
+        self.doc.image(raster, col, cols, rows, prefix, alt);
     }
 
     // -- inline flow --------------------------------------------------------
@@ -1074,21 +1127,13 @@ impl<'a> Renderer<'a> {
         let cw = self.content_width();
         let avail_px = cw as f64 * cw_px;
         let mut fallback: Vec<Span> = Vec::new();
-        let mut group: Vec<Raster> = Vec::new();
+        let mut group: Vec<Arc<Raster>> = Vec::new();
         let gap = (cw_px / 2.0).round() as u32;
         let mut group_w = 0u32;
 
         for r in refs {
-            let pic = if self.o.graphics {
-                r.key
-                    .as_ref()
-                    .and_then(|k| self.cache.get(k))
-                    .cloned()
-                    .flatten()
-            } else {
-                None
-            };
-            let Some(pic) = pic else {
+            let key = r.key.as_ref().filter(|_| self.o.graphics);
+            let Some((key, pic)) = key.and_then(|k| Some((k, self.assets.get(k)?))) else {
                 if !fallback.is_empty() {
                     fallback.push(Span::plain(" "));
                 }
@@ -1096,7 +1141,7 @@ impl<'a> Renderer<'a> {
                 continue;
             };
             let (w, h) = self.img_size(&pic, &r, avail_px);
-            let raster = pic.render(w, h);
+            let raster = self.scaled(key, &pic, w, h);
             if !group.is_empty() && (group_w + gap + raster.w) as f64 > avail_px {
                 self.place_group(std::mem::take(&mut group), gap, ch_px, cw_px);
                 group_w = 0;
@@ -1116,31 +1161,28 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn place_group(&mut self, group: Vec<Raster>, gap: u32, ch_px: f64, cw_px: f64) {
-        let raster = if group.len() == 1 {
-            group.into_iter().next().unwrap()
-        } else {
-            compose_row(&group, gap)
+    /// The picture resampled to `w` x `h` px; kept for the next layout.
+    fn scaled(&mut self, key: &str, pic: &Picture, w: u32, h: u32) -> Arc<Raster> {
+        let cached = self.assets.scaled.entry((key.to_string(), w, h));
+        cached.or_insert_with(|| Arc::new(pic.render(w, h))).clone()
+    }
+
+    fn place_group(&mut self, group: Vec<Arc<Raster>>, gap: u32, ch_px: f64, cw_px: f64) {
+        let raster = match &group[..] {
+            [one] => one.clone(),
+            _ => Arc::new(compose_row(&group, gap)),
         };
         let cols = (raster.w as f64 / cw_px).ceil().max(1.0) as u32;
         let rows = (raster.h as f64 / ch_px).ceil().max(1.0) as u32;
-        let cw = self.content_width() as u32;
-        let mut col = self.prefix_width() as u32;
-        if self.centered() && cols < cw {
-            col += (cw - cols) / 2;
-        }
-        let p = self.prefix(true);
-        // keep quote bars, drop list markers for image rows
-        let prefix: Vec<Span> = p.into_iter().filter(|s| s.text.contains('▎')).collect();
-        self.doc.image(raster, col, cols, rows, prefix);
+        self.place(raster, cols, rows, String::new());
     }
 
     // -- code ----------------------------------------------------------------
 
     fn code_block(&mut self, lang: &str, text: &str) {
-        if lang == "mermaid" {
-            if let Some(Some(pic)) = self.cache.get(&mermaid_key(text)) {
-                let pic = pic.clone();
+        if diagram::is_diagram(lang) {
+            let key = diagram_key(lang, text, self.t.dark);
+            if let Some(pic) = self.assets.get(&key).filter(|_| self.o.graphics) {
                 let avail = self.content_width() as f64 * self.o.cell.0;
                 let r = ImgRef {
                     key: None,
@@ -1150,8 +1192,8 @@ impl<'a> Renderer<'a> {
                     link: None,
                 };
                 let (w, h) = self.img_size(&pic, &r, avail);
+                let raster = self.scaled(&key, &pic, w, h);
                 self.center.push(true);
-                let raster = pic.render(w, h);
                 self.place_group(vec![raster], 0, self.o.cell.1, self.o.cell.0);
                 self.center.pop();
                 return;
@@ -1161,8 +1203,13 @@ impl<'a> Renderer<'a> {
         let cw = self.content_width();
         let inner = cw.saturating_sub(2).max(4);
         let text = text.strip_suffix('\n').unwrap_or(text);
-        let syntax = code::find_syntax(lang);
-        let lines = code::highlight(text, syntax, self.t, 5000);
+        let theme = self.t;
+        let highlighted = self.assets.code.entry(code_key(lang, text));
+        let lines = highlighted
+            .or_insert_with(|| {
+                Arc::new(code::highlight(text, code::find_syntax(lang), theme, 5000))
+            })
+            .clone();
 
         let label = if lang.is_empty() {
             String::new()
@@ -1189,8 +1236,8 @@ impl<'a> Renderer<'a> {
         ));
         self.push_code_row(top, cw);
 
-        for line in lines {
-            for part in hard_wrap(&line, inner) {
+        for line in lines.iter() {
+            for part in hard_wrap(line, inner) {
                 let mut row = self.prefix(false);
                 row.push(Span::new(
                     " ",
@@ -1244,10 +1291,9 @@ impl<'a> Renderer<'a> {
         let avail = cw.saturating_sub(overhead).max(ncols * 3);
         let natural: Vec<usize> = (0..ncols)
             .map(|c| {
-                t.rows
-                    .iter()
-                    .filter_map(|r| r.get(c))
-                    .map(|cell| spans_width(cell))
+                let cells = t.rows.iter().filter_map(|r| r.get(c));
+                cells
+                    .map(|cell| spans_width(&cell.text).max(self.cell_images(cell, avail).1))
                     .max()
                     .unwrap_or(0)
                     .max(1)
@@ -1273,23 +1319,50 @@ impl<'a> Renderer<'a> {
             let is_head = ri < t.header_rows;
             let striped = !is_head && (ri - t.header_rows) % 2 == 1;
             let cell_bg = if striped { Some(stripe) } else { None };
-            let wrapped: Vec<Vec<Vec<Span>>> = (0..ncols)
+            // each cell: its wrapped text and the rows its pictures take
+            let empty = Cell::default();
+            let cells: Vec<CellLayout> = (0..ncols)
                 .map(|c| {
-                    let cell = row.get(c).cloned().unwrap_or_default();
-                    let mut cell = cell;
-                    if let Some(f) = cell.first_mut() {
+                    let cell = row.get(c).unwrap_or(&empty);
+                    let mut text = cell.text.clone();
+                    if let Some(f) = text.first_mut() {
                         f.text = f.text.trim_start().to_string();
                     }
-                    wrap(&cell, widths[c])
+                    let blank = text.iter().all(|s| s.text.trim().is_empty());
+                    let (picture, cols) = self.cell_images(cell, widths[c]);
+                    let rows = picture
+                        .as_ref()
+                        .map_or(0, |p| (p.h as f64 / self.o.cell.1).ceil().max(1.0) as usize);
+                    let lines = match blank && picture.is_some() {
+                        true => Vec::new(),
+                        false => wrap(&text, widths[c]),
+                    };
+                    (lines, picture, cols, rows, cell.images_first)
                 })
                 .collect();
-            let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1);
+            let height = cells.iter().map(|c| c.0.len() + c.3).max().unwrap_or(1);
             for li in 0..height {
                 let mut p = self.prefix(false);
                 p.push(Span::new("│", b.clone()));
-                for c in 0..ncols {
-                    let content = wrapped[c].get(li).cloned().unwrap_or_default();
-                    let w = spans_width(&content);
+                let mut x = self.prefix_width() + 1;
+                for (c, (lines, picture, pic_cols, pic_rows, pic_first)) in cells.iter().enumerate()
+                {
+                    // rows `pic_at..pic_at + pic_rows` of the cell are left blank for the picture
+                    let pic_at = if *pic_first { 0 } else { lines.len() };
+                    let in_picture = (pic_at..pic_at + pic_rows).contains(&li);
+                    let text_line = if li < pic_at {
+                        li
+                    } else {
+                        li.saturating_sub(*pic_rows)
+                    };
+                    let content = match in_picture {
+                        true => Vec::new(),
+                        false => lines.get(text_line).cloned().unwrap_or_default(),
+                    };
+                    let w = match in_picture {
+                        true => *pic_cols,
+                        false => spans_width(&content),
+                    };
                     let free = widths[c].saturating_sub(w);
                     let align = t.aligns.get(c).copied().unwrap_or(Alignment::None);
                     let (lp, rp) = match align {
@@ -1298,11 +1371,24 @@ impl<'a> Renderer<'a> {
                         _ if is_head => (free / 2, free - free / 2),
                         _ => (0, free),
                     };
+                    if let Some(picture) = picture.as_ref().filter(|_| li == pic_at) {
+                        let (row, col) = (self.doc.rows.len(), (x + 1 + lp) as u32);
+                        self.doc.overlay(
+                            picture.clone(),
+                            row,
+                            col,
+                            *pic_cols as u32,
+                            *pic_rows as u32,
+                        );
+                    }
                     let pad_style = Style {
                         bg: cell_bg,
                         ..Default::default()
                     };
                     p.push(Span::new(" ".repeat(lp + 1), pad_style.clone()));
+                    if in_picture {
+                        p.push(Span::new(" ".repeat(w), pad_style.clone()));
+                    }
                     for mut s in content {
                         if cell_bg.is_some() && s.style.bg.is_none() {
                             s.style.bg = cell_bg;
@@ -1311,6 +1397,7 @@ impl<'a> Renderer<'a> {
                     }
                     p.push(Span::new(" ".repeat(rp + 1), pad_style));
                     p.push(Span::new("│", b.clone()));
+                    x += widths[c] + 3;
                 }
                 self.doc.text(p);
             }
@@ -1323,6 +1410,38 @@ impl<'a> Renderer<'a> {
         let mut p = self.prefix(false);
         p.push(line("╰", "┴", "╯", &widths));
         self.doc.text(p);
+    }
+
+    /// The pictures of a table cell side by side, scaled to fit `width`
+    /// cells, and the number of cells they take.
+    fn cell_images(&mut self, cell: &Cell, width: usize) -> (Option<Arc<Raster>>, usize) {
+        if cell.images.is_empty() {
+            return (None, 0);
+        }
+        let cw_px = self.o.cell.0;
+        let avail = width as f64 * cw_px;
+        let gap = (cw_px / 2.0).round() as u32;
+        let gaps = (gap as usize * (cell.images.len() - 1)) as f64;
+        let sizes: Vec<(u32, u32)> = cell
+            .images
+            .iter()
+            .map(|(_, pic, r)| self.img_size(pic, r, avail))
+            .collect();
+        let total: f64 = sizes.iter().map(|s| s.0 as f64).sum();
+        let shrink = ((avail - gaps).max(1.0) / total).min(1.0);
+        let scale = |v: u32| ((v as f64 * shrink).round() as u32).max(1);
+        let rasters: Vec<Arc<Raster>> = cell
+            .images
+            .iter()
+            .zip(&sizes)
+            .map(|((key, pic, _), &(w, h))| self.scaled(key, pic, scale(w), scale(h)))
+            .collect();
+        let raster = match &rasters[..] {
+            [one] => one.clone(),
+            _ => Arc::new(compose_row(&rasters, gap)),
+        };
+        let cols = ((raster.w as f64 / cw_px).ceil() as usize).clamp(1, width.max(1));
+        (Some(raster), cols)
     }
 
     // -- html --------------------------------------------------------------------
@@ -1410,6 +1529,22 @@ impl<'a> Renderer<'a> {
                 self.html_style(name, |s| s.bold = true);
             }
             "details" | "ul" | "ol" | "table" | "tr" => self.flush_inline(),
+            "dl" => {
+                self.flush_inline();
+                self.block_gap();
+            }
+            "dt" => {
+                self.flush_inline();
+                self.html_style(name, |s| s.bold = true);
+            }
+            "dd" => {
+                self.flush_inline();
+                self.html_dd += 1;
+                self.blocks.push(Block::Item {
+                    marker: None,
+                    indent: 4,
+                });
+            }
             "li" => {
                 self.flush_inline();
                 self.push_text("• ");
@@ -1434,11 +1569,18 @@ impl<'a> Renderer<'a> {
                 self.end_heading();
                 self.center.pop();
             }
-            "summary" | "li" | "tr" | "details" | "ul" | "ol" | "table" => {
-                if name == "summary" {
+            "summary" | "dt" | "li" | "tr" | "details" | "ul" | "ol" | "table" | "dl" => {
+                if name == "summary" || name == "dt" {
                     self.close_html_style(name);
                 }
                 self.flush_inline();
+            }
+            "dd" if self.html_dd > 0 => {
+                self.flush_inline();
+                self.html_dd -= 1;
+                if matches!(self.blocks.last(), Some(Block::Item { .. })) {
+                    self.blocks.pop();
+                }
             }
             _ => self.close_html_style(name),
         }
@@ -1463,11 +1605,10 @@ impl<'a> Renderer<'a> {
             if matches!(self.doc.rows.get(row), Some(Row::Text { .. })) {
                 let raster =
                     crate::raster::checkbox(checked, w, h, rgb(self.t.accent), rgb(self.t.muted));
-                self.doc.icon(raster, row, col, 2);
+                self.doc.overlay(Arc::new(raster), row, col, 2, 1);
             }
         }
-        if let Some(level) = self.heading {
-            let _ = level;
+        if self.heading.is_some() {
             self.end_heading();
         }
         while self.doc.rows.len() > 1 && self.doc.last_is_blank() {
@@ -1554,16 +1695,81 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
-fn superscript(label: &str) -> String {
+fn superscript(n: usize) -> String {
     const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
-    if label.chars().all(|c| c.is_ascii_digit()) {
-        label
-            .chars()
-            .map(|c| SUP[c as usize - '0' as usize])
-            .collect()
-    } else {
-        format!("[{label}]")
+    n.to_string()
+        .bytes()
+        .map(|d| SUP[(d - b'0') as usize])
+        .collect()
+}
+
+/// Split text into plain parts and bare URLs (`https://…`, `www.…`), each
+/// with the link target for URLs. With `linkify` off the text stays whole.
+fn autolinks(text: &str, linkify: bool) -> Vec<(&str, Option<String>)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    if !linkify {
+        rest = "";
+        out.push((text, None));
     }
+    loop {
+        let found = ["https://", "http://", "www."]
+            .iter()
+            .filter_map(|p| {
+                rest.match_indices(p)
+                    .map(|m| m.0)
+                    .find(|&i| word_start(rest, i))
+            })
+            .min();
+        let Some(start) = found else {
+            break;
+        };
+        let len = rest[start..]
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(rest.len() - start);
+        let mut url = &rest[start..start + len];
+        // trailing punctuation belongs to the sentence, not the URL
+        while let Some(last) = url.chars().last() {
+            let unbalanced = last == ')' && url.matches(')').count() > url.matches('(').count();
+            if !unbalanced && !".,;:!?'\"*_~".contains(last) {
+                break;
+            }
+            url = &url[..url.len() - last.len_utf8()];
+        }
+        let host = url
+            .split("//")
+            .last()
+            .unwrap_or("")
+            .trim_start_matches("www.");
+        if host.is_empty() {
+            // not a link after all: keep the prefix as text
+            let cut = start + rest[start..].chars().next().map_or(1, char::len_utf8);
+            out.push((&rest[..cut], None));
+            rest = &rest[cut..];
+            continue;
+        }
+        if start > 0 {
+            out.push((&rest[..start], None));
+        }
+        let target = match url.starts_with("www.") {
+            true => format!("http://{url}"),
+            false => url.to_string(),
+        };
+        out.push((url, Some(target)));
+        rest = &rest[start + url.len()..];
+    }
+    if !rest.is_empty() {
+        out.push((rest, None));
+    }
+    out
+}
+
+/// Is byte `i` the start of a word (not preceded by a letter or digit)?
+fn word_start(s: &str, i: usize) -> bool {
+    !s[..i]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
 }
 
 /// Replace GitHub emoji shortcodes such as `:rocket:`.
@@ -1612,6 +1818,7 @@ mod tests {
             text_sizing: false,
             graphics: false,
             offline: true,
+            wait: true,
             max_img_h: 400.0,
         };
         let mut m = Markdown::new(md.to_string(), Base::Dir(".".into()));
@@ -1656,6 +1863,84 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| r.trim() == "Proj" && r.starts_with(' ')));
+    }
+
+    #[test]
+    fn footnotes_are_numbered_and_last() {
+        let rows = render(
+            "A[^x] and B[^y].\n\n[^y]: second\n[^x]: first\n\nAfter.\n",
+            40,
+        );
+        assert_eq!(rows[0], "A¹ and B².");
+        let after = rows.iter().position(|r| r == "After.").unwrap();
+        let first = rows.iter().position(|r| r == "1. first").unwrap();
+        let second = rows.iter().position(|r| r == "2. second").unwrap();
+        assert!(after < first && first < second);
+    }
+
+    #[test]
+    fn bare_urls_become_links() {
+        let parts = autolinks("see https://a.io/x(1), www.b.org. or http:// x", true);
+        let urls: Vec<_> = parts.iter().filter_map(|p| p.1.as_deref()).collect();
+        assert_eq!(urls, ["https://a.io/x(1)", "http://www.b.org"]);
+        let text: String = parts.iter().map(|p| p.0).collect();
+        assert_eq!(text, "see https://a.io/x(1), www.b.org. or http:// x");
+        assert_eq!(autolinks("xhttps://a.io", true).len(), 1);
+        assert_eq!(autolinks("https://a.io", false), [("https://a.io", None)]);
+    }
+
+    #[test]
+    fn html_definition_list() {
+        let rows = render(
+            "<dl>\n<dt>Term</dt>\n<dd>Meaning of it.</dd>\n</dl>\n\nAfter\n",
+            40,
+        );
+        assert_eq!(rows[0], "Term");
+        assert_eq!(rows[1], "    Meaning of it.");
+        assert_eq!(rows.last().unwrap(), "After");
+    }
+
+    #[test]
+    fn diagrams_without_graphics_stay_code() {
+        let rows = render("```stl\nsolid x\nendsolid\n```\n", 40);
+        assert!(rows.iter().any(|r| r.contains("solid x")));
+    }
+
+    #[test]
+    fn table_cell_images() {
+        let dir = std::env::temp_dir().join(format!("shw-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="50"><rect width="60" height="50" fill="red"/></svg>"#;
+        std::fs::write(dir.join("p.svg"), svg).unwrap();
+        let theme = Theme::new(true);
+        let o = LayoutOpts {
+            width: 60,
+            fg: Rgb(255, 255, 255),
+            cell: (10.0, 20.0),
+            theme: &theme,
+            text_sizing: false,
+            graphics: true,
+            offline: true,
+            wait: true,
+            max_img_h: 400.0,
+        };
+        let md = "| a | b |\n|---|---|\n| ![x](p.svg) | text |\n| cap ![x](p.svg) | ![m](missing.png) |\n";
+        let doc = Markdown::new(md.into(), Base::Dir(dir.clone())).layout(&o);
+        let _ = std::fs::remove_dir_all(&dir);
+        let rows: Vec<String> = (0..doc.rows.len()).map(|i| doc.plain(i)).collect();
+        // 60x50 px at 10x20 px cells: 6 columns, 3 rows
+        let overlays: Vec<_> = doc.images.iter().filter(|im| im.overlay).collect();
+        assert_eq!(overlays.len(), 2);
+        assert!(overlays
+            .iter()
+            .all(|im| (im.cols, im.rows, im.col) == (6, 3, 2)));
+        assert_eq!(overlays[0].start, 3);
+        assert_eq!(rows[3], "│        │ text │");
+        assert_eq!(rows[5], "│        │      │");
+        // second row: caption above the picture, alt text for the missing one
+        assert_eq!(overlays[1].start, 7);
+        assert!(rows[6].starts_with("│ cap    │") && rows[6].contains('m'));
+        assert_eq!(rows.len(), 11);
     }
 
     #[test]
