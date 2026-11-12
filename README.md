@@ -44,8 +44,10 @@ shw ~/Pictures         # browse a folder (n / p)
   - search with `/`, `n`, `N`; select text with the mouse to copy it (the terminal's native selection), and
     click links
 - **Code / text** files with syntax highlighting and line numbers, and a hex view for binaries.
-- **Works everywhere kitty graphics work**: kitty, Ghostty, WezTerm and Konsole, **over ssh**, and inside **tmux**
-  (Unicode placeholders + passthrough).
+- **Works everywhere kitty graphics work**: kitty, Ghostty, WezTerm and Konsole, **over ssh**, and inside **tmux**.
+- **Optimized for ssh + tmux**: zooming and panning images on a remote machine inside tmux stays as responsive as
+  locally. Each step moves an image that is already in the terminal (a few bytes), and only the pixels that are
+  actually visible are sent once you stop.
 - **Scriptable**: `-i/--inline` prints straight into the terminal, like `icat`, which suits fzf previews,
   file managers and scripts. It reads from stdin and URLs, and opens GitHub links (`shw https://github.com/user/repo`
   shows the README).
@@ -172,10 +174,14 @@ shw --completions fish > ~/.config/fish/completions/shw.fish
 | others | ❌ `shw` reports that the protocol is missing |
 
 - **ssh**: works out of the box. Data is sent inline and PNG-compressed. When you zoom or pan an image,
-  shw reuses the frame already on screen and lets the terminal scale and move it (a few bytes per step,
-  also inside tmux); one sharp frame follows when you stop, and is cancelled if you move again. Video frames are capped at 640×360 and 30 fps for
-  smooth playback over a network, and the terminal scales them up.
-- **tmux**: enable passthrough with `set -g allow-passthrough on`. shw then uses Unicode placeholders automatically.
+  shw reuses the frame already on screen and lets the terminal scale and move it (a few bytes per step).
+  One sharp frame follows when you stop; above 100 % it carries only the visible pixels at the image's own
+  resolution and the terminal scales them, and it is cancelled if you move again. Video frames are capped at
+  640×360 and 30 fps for smooth playback over a network, and the terminal scales them up.
+- **tmux**: optimized for it, locally and over ssh. Enable passthrough with `set -g allow-passthrough on`; shw then
+  uses Unicode placeholders automatically. Zooming and panning only rewrite placeholder cells (plain text that
+  tmux redraws like anything else), so they stay smooth even for large images; when you zoom in far, shw uploads
+  a crop around the view once instead of re-sending every frame.
 - Run `shw --doctor` to see what was detected.
 
 ## How it works

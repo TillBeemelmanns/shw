@@ -88,6 +88,11 @@ const REMOTE_SETTLE: Duration = Duration::from_millis(300);
 const INTERRUPT_PIECE: usize = 32 * 1024;
 /// Largest proxy image uploaded once for remote zooming / panning, in pixels.
 const PROXY_MAX_PIXELS: f64 = 6.0e6;
+/// Largest regional proxy (a crop around the view, used under tmux when the
+/// zoomed picture is too large to address with placeholder cells), in pixels.
+const REGION_MAX_PIXELS: f64 = 3.0e6;
+/// Highest row / column index a placeholder cell can name explicitly.
+const MAX_INDEX: f64 = DIACRITICS.len() as f64 - 1.0;
 
 /// A downscaled copy of the picture kept in the terminal. Over ssh, zooming
 /// and panning only re-place it instead of re-sending pixels; a sharp frame
@@ -101,6 +106,25 @@ struct Proxy {
     bg: Background,
     /// Cell grid (columns, rows) of the current virtual placement.
     grid: Option<(u32, u32)>,
+    /// Part of the picture it shows (x, y, w, h in picture pixels).
+    region: (f64, f64, f64, f64),
+}
+
+/// Where the visible window falls in a proxy's placeholder grid.
+struct GridLayout {
+    /// Grid size in cells (columns, rows).
+    grid: (u32, u32),
+    /// First visible grid column / row, number of visible ones, and the
+    /// screen offset (in cells) of the window.
+    sc: u32,
+    vc: u32,
+    col0: u32,
+    sr: u32,
+    vr: u32,
+    row0: u32,
+    /// View centre snapped to the cell grid.
+    cx: f64,
+    cy: f64,
 }
 
 /// User input that should cancel a sharp frame in flight (not plain pointer
@@ -198,6 +222,9 @@ struct Viewer<'a> {
     /// Pixels travel over the network (ssh, direct transfer).
     remote: bool,
     proxy: Option<Proxy>,
+    /// The whole-picture proxy, kept in the terminal while a regional proxy
+    /// is in use, so zooming back out needs no upload.
+    spare: Option<Proxy>,
     /// The proxy placement is what is currently on screen.
     on_proxy: bool,
     /// Size and background of the shown sharp frame when it covers the whole
@@ -328,14 +355,24 @@ impl<'a> Viewer<'a> {
         (crop, disp_w, disp_h)
     }
 
-    /// Upload the proxy image if it is missing or stale; returns (id, w, h).
+    /// Make sure a proxy of the whole picture exists (adopting the frame on
+    /// screen when possible); returns (id, w, h).
     fn ensure_proxy(&mut self, ws: WinSize, out: &mut Vec<u8>) -> (u32, u32, u32) {
+        let (iw, ih) = self.dims();
         if let Some(p) = &self.proxy {
-            if p.bg == self.bg {
+            if p.bg == self.bg && p.region == (0.0, 0.0, iw, ih) {
                 return (p.id, p.w, p.h);
             }
         }
         self.drop_proxy(out);
+        if let Some(p) = self.spare.take() {
+            if p.bg == self.bg {
+                let r = (p.id, p.w, p.h);
+                self.proxy = Some(p);
+                return r;
+            }
+            self.ctx.kitty.delete(out, p.id);
+        }
         // The frame on screen shows the whole picture (the usual case when
         // zooming starts): adopt it as the proxy, so nothing is uploaded.
         if let (true, Some((w, h, bg))) = (self.shown, self.shown_full) {
@@ -351,35 +388,73 @@ impl<'a> Viewer<'a> {
                     h,
                     bg,
                     grid: None,
+                    region: (0.0, 0.0, iw, ih),
                 });
                 return (id, w, h);
             }
         }
         // Otherwise upload the picture at its default (whole-picture) size:
         // about as much data as one sharp frame.
-        let (iw, ih) = self.dims();
         let mut s = self.default_zoom(ws);
         if self.pic.svg.is_none() {
             s = s.min(1.0);
         }
         s = s.min((PROXY_MAX_PIXELS / (iw * ih)).sqrt());
+        self.upload_proxy(out, (0.0, 0.0, iw, ih), s)
+    }
+
+    /// Render `region` of the picture at scale `s` and upload it as the proxy.
+    fn upload_proxy(
+        &mut self,
+        out: &mut Vec<u8>,
+        region: (f64, f64, f64, f64),
+        s: f64,
+    ) -> (u32, u32, u32) {
+        let (iw, ih) = self.dims();
+        let whole = (0.0, 0.0, iw, ih);
+        // Keep a whole-picture proxy as the spare while a region is shown.
+        let keep = region != whole
+            && self
+                .proxy
+                .as_ref()
+                .is_some_and(|p| p.region == whole && p.bg == self.bg);
+        if keep {
+            if let Some(old) = self.spare.take() {
+                self.ctx.kitty.delete(out, old.id);
+            }
+            self.spare = self.proxy.take();
+            self.on_proxy = false;
+        } else {
+            self.drop_proxy(out);
+        }
         let (pw, ph) = (
-            (iw * s).round().max(1.0) as u32,
-            (ih * s).round().max(1.0) as u32,
+            (region.2 * s).round().max(1.0) as u32,
+            (region.3 * s).round().max(1.0) as u32,
         );
         let raster = if let Some(tree) = &self.pic.svg {
-            render_svg(tree, (0.0, 0.0, iw, ih), pw, ph)
+            render_svg(tree, region, pw, ph)
         } else {
-            let (level, _) = self.source_for(s);
+            let (level, scale) = self.source_for(s);
             let src = if level == 0 {
                 &self.pic.frames[0].raster
             } else {
                 &self.mips[level - 1]
             };
-            if src.w == pw && src.h == ph {
+            let r = (
+                region.0 * scale,
+                region.1 * scale,
+                region.2 * scale,
+                region.3 * scale,
+            );
+            if region == whole && src.w == pw && src.h == ph {
                 src.clone()
-            } else {
+            } else if region == whole {
                 resize(src, pw, ph)
+            } else if s == 1.0 && level == 0 {
+                // A plain crop: original pixels compress best.
+                resize_region(src, r, pw, ph, Filter::Nearest)
+            } else {
+                resize_region(src, r, pw, ph, Filter::Lanczos)
             }
         };
         let raster = match self.bg.color() {
@@ -390,18 +465,23 @@ impl<'a> Viewer<'a> {
         self.ctx
             .kitty
             .transmit(out, &raster, &format!("a=t,i={id}"));
+        crate::app::trace(format!(
+            "proxy uploaded: {pw}x{ph} of region {:.0}x{:.0}",
+            region.2, region.3
+        ));
         self.proxy = Some(Proxy {
             id,
             w: pw,
             h: ph,
             bg: self.bg,
             grid: None,
+            region,
         });
         (id, pw, ph)
     }
 
     /// Show the current view from the proxy. Returns false if that is not
-    /// possible at this zoom (the placeholder grid would be too large).
+    /// possible (then a sharp frame follows once input pauses).
     fn show_proxy(&mut self, ws: WinSize) -> bool {
         if self.ctx.kitty.placeholders {
             return self.show_proxy_grid(ws);
@@ -410,63 +490,137 @@ impl<'a> Viewer<'a> {
         true
     }
 
-    /// Unicode-placeholder variant (tmux): one virtual placement covers the
-    /// whole zoomed image as a grid of cells (a few bytes, sent only when the
-    /// zoom changes) and only the visible cells are printed, as text that
-    /// tmux redraws like any other. Panning moves by whole cells.
-    fn show_proxy_grid(&mut self, ws: WinSize) -> bool {
+    /// Lay the current view out on the placeholder grid of a proxy showing
+    /// `region`. `None` if the window cannot be addressed (its first column /
+    /// last row index is beyond the diacritics table) or the region does not
+    /// cover the view.
+    fn grid_layout(&mut self, ws: WinSize, region: (f64, f64, f64, f64)) -> Option<GridLayout> {
+        self.view(ws); // clamp the centre
+        let (cw, ch) = ws.cell();
+        let (aw, ah) = self.area(ws);
+        let z = self.zoom;
+        let (rx, ry, rw, rh) = region;
+        let gc = (rw * z / cw).round().max(1.0);
+        let gr = (rh * z / ch).round().max(1.0);
+        let ac = (aw / cw).round().max(1.0);
+        let ar = (ah / ch).round().max(1.0);
+        let (sc, vc, col0) = grid_window(gc, ac, (self.cx - rx) * z / cw);
+        let (sr, vr, row0) = grid_window(gr, ar, (self.cy - ry) * z / ch);
+        // Cells after the first in a row continue the column implicitly, so
+        // only the first column and the rows need explicit indices.
+        if sc as f64 > MAX_INDEX || (sr + vr) as f64 - 1.0 > MAX_INDEX {
+            return None;
+        }
+        // Snap the centre to the cell grid so the sharp frame lines up.
+        let cx = if gc > ac {
+            rx + (sc as f64 + ac / 2.0) * cw / z
+        } else {
+            rx + rw / 2.0
+        };
+        let cy = if gr > ar {
+            ry + (sr as f64 + ar / 2.0) * ch / z
+        } else {
+            ry + rh / 2.0
+        };
+        // A region crop clamps the window at its edges: then it does not
+        // show what the view wants.
+        if (cx - self.cx).abs() > cw / z || (cy - self.cy).abs() > ch / z {
+            return None;
+        }
+        Some(GridLayout {
+            grid: (gc as u32, gr as u32),
+            sc,
+            vc,
+            col0,
+            sr,
+            vr,
+            row0,
+            cx,
+            cy,
+        })
+    }
+
+    /// Upload a crop around the view as the proxy, sized so the window sits
+    /// in the middle of what placeholder cells can address.
+    fn upload_region_proxy(&mut self, ws: WinSize, out: &mut Vec<u8>) {
         let (cw, ch) = ws.cell();
         let (aw, ah) = self.area(ws);
         let (iw, ih) = self.dims();
         let z = self.zoom;
-        let gc = (iw * z / cw).round().max(1.0);
-        let gr = (ih * z / ch).round().max(1.0);
-        // Row / column indices are limited by the diacritics table.
-        let max = DIACRITICS.len() as f64;
-        if gc > max || gr > max {
-            return false;
-        }
         let ac = (aw / cw).round().max(1.0);
         let ar = (ah / ch).round().max(1.0);
-        let (sc, vc, col0) = grid_window(gc, ac, self.cx * z / cw);
-        let (sr, vr, row0) = grid_window(gr, ar, self.cy * z / ch);
-        // Snap the centre to the cell grid so the sharp frame lines up.
-        self.cx = if gc > ac {
-            (sc as f64 + ac / 2.0) * cw / z
-        } else {
-            iw / 2.0
-        };
-        self.cy = if gr > ar {
-            (sr as f64 + ar / 2.0) * ch / z
-        } else {
-            ih / 2.0
-        };
+        // Up to twice the window wide (first column must stay addressable)
+        // and three times as tall (all rows must stay addressable).
+        let rc = (2.0 * ac).min(MAX_INDEX + ac);
+        let rr = (3.0 * ar).min(MAX_INDEX + 1.0);
+        let rw = (rc * cw / z).min(iw).floor().max(1.0);
+        let rh = (rr * ch / z).min(ih).floor().max(1.0);
+        let rx = (self.cx - rw / 2.0).clamp(0.0, iw - rw).floor();
+        let ry = (self.cy - rh / 2.0).clamp(0.0, ih - rh).floor();
+        let mut s = z.min(1.0);
+        s = s.min((REGION_MAX_PIXELS / (rw * rh)).sqrt());
+        self.upload_proxy(out, (rx, ry, rw, rh), s);
+    }
 
-        let mut out: Vec<u8> = Vec::with_capacity((vc * vr * 4 + 4096) as usize);
+    /// Unicode-placeholder variant (tmux): one virtual placement covers the
+    /// proxy's region as a grid of cells (a few bytes, sent only when the
+    /// zoom changes) and only the visible cells are printed, as text that
+    /// tmux redraws like any other. Panning moves by whole cells.
+    fn show_proxy_grid(&mut self, ws: WinSize) -> bool {
+        let (iw, ih) = self.dims();
+        let full = (0.0, 0.0, iw, ih);
+        let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
         out.extend_from_slice(b"\x1b[?2026h");
-        let (id, _, _) = self.ensure_proxy(ws, &mut out);
-        let grid = (gc as u32, gr as u32);
+        let current = self
+            .proxy
+            .as_ref()
+            .filter(|p| p.bg == self.bg)
+            .map(|p| p.region);
+        let layout = match current.and_then(|r| self.grid_layout(ws, r)) {
+            Some(l) => l,
+            None => {
+                if let Some(l) = self.grid_layout(ws, full) {
+                    self.ensure_proxy(ws, &mut out);
+                    l
+                } else {
+                    self.upload_region_proxy(ws, &mut out);
+                    let region = self.proxy.as_ref().map_or(full, |p| p.region);
+                    match self.grid_layout(ws, region) {
+                        Some(l) => l,
+                        None => return false,
+                    }
+                }
+            }
+        };
+        self.cx = layout.cx;
+        self.cy = layout.cy;
+        let Some(id) = self.proxy.as_ref().map(|p| p.id) else {
+            return false;
+        };
         let k = &self.ctx.kitty;
         if let Some(p) = self.proxy.as_mut() {
-            if p.grid != Some(grid) {
+            if p.grid != Some(layout.grid) {
                 // Drop the old virtual placement (keeping the data), then create
                 // one for the new grid; exactly one exists for the image.
                 k.cmd(&mut out, &format!("a=d,d=i,i={id},q=2"));
                 k.cmd(
                     &mut out,
-                    &format!("a=p,U=1,i={id},p=1,c={},r={},q=2", grid.0, grid.1),
+                    &format!(
+                        "a=p,U=1,i={id},p=1,c={},r={},q=2",
+                        layout.grid.0, layout.grid.1
+                    ),
                 );
-                p.grid = Some(grid);
+                p.grid = Some(layout.grid);
             }
         }
         out.extend_from_slice(b"\x1b[0m\x1b[2J");
-        for r in 0..vr {
+        for r in 0..layout.vr {
             out.extend_from_slice(
                 format!(
                     "\x1b[{};{}H{}",
-                    row0 + r + 1,
-                    col0 + 1,
-                    placeholder_row_at(id, sr + r, sc, vc)
+                    layout.row0 + r + 1,
+                    layout.col0 + 1,
+                    placeholder_row_at(id, layout.sr + r, layout.sc, layout.vc)
                 )
                 .as_bytes(),
             );
@@ -493,15 +647,16 @@ impl<'a> Viewer<'a> {
         let (iw, ih) = self.dims();
         let z = self.zoom;
         let (crop, disp_w, disp_h) = self.view(ws);
-        let (kx, ky) = (pw as f64 / iw, ph as f64 / ih);
+        let (rx, ry, rw, rh) = self.proxy.as_ref().map_or((0.0, 0.0, iw, ih), |p| p.region);
+        let (kx, ky) = (pw as f64 / rw, ph as f64 / rh);
         let (x, y, w, h, size, off_x, off_y);
         if (z / kx - 1.0).abs() < 1e-3 {
             // The proxy has exactly the display resolution: show its pixels
             // 1:1 (no scaling, pixel-exact like a sharp frame).
             w = (disp_w.round() as u32).clamp(1, pw);
             h = (disp_h.round() as u32).clamp(1, ph);
-            x = ((crop.0 * kx).round() as u32).min(pw - w);
-            y = ((crop.1 * ky).round() as u32).min(ph - h);
+            x = (((crop.0 - rx) * kx).round().max(0.0) as u32).min(pw - w);
+            y = (((crop.1 - ry) * ky).round().max(0.0) as u32).min(ph - h);
             size = String::new();
             off_x = ((aw - w as f64) / 2.0).max(0.0);
             off_y = ((ah - h as f64) / 2.0).max(0.0);
@@ -514,8 +669,8 @@ impl<'a> Viewer<'a> {
             let sh = (rows * ch / z).min(ih);
             let sx = (self.cx - sw / 2.0).clamp(0.0, iw - sw);
             let sy = (self.cy - sh / 2.0).clamp(0.0, ih - sh);
-            x = ((sx * kx).round() as u32).min(pw - 1);
-            y = ((sy * ky).round() as u32).min(ph - 1);
+            x = (((sx - rx) * kx).round().max(0.0) as u32).min(pw - 1);
+            y = (((sy - ry) * ky).round().max(0.0) as u32).min(ph - 1);
             w = ((sw * kx).round() as u32).clamp(1, pw - x);
             h = ((sh * ky).round() as u32).clamp(1, ph - y);
             size = format!("c={},r={},", cols as u32, rows as u32);
@@ -550,7 +705,7 @@ impl<'a> Viewer<'a> {
         let Some(p) = &self.proxy else {
             return true;
         };
-        let ps = p.w as f64 / self.pic.width as f64;
+        let ps = p.w as f64 / p.region.2;
         self.zoom > ps * 1.01 || ps > self.zoom * 1.25
     }
 
@@ -571,6 +726,14 @@ impl<'a> Viewer<'a> {
         self.on_proxy = false;
     }
 
+    /// Free the proxy and the spare.
+    fn drop_all_proxies(&mut self, out: &mut Vec<u8>) {
+        self.drop_proxy(out);
+        if let Some(p) = self.spare.take() {
+            self.ctx.kitty.delete(out, p.id);
+        }
+    }
+
     /// Draw a sharp frame of the current view. With `interruptible`, the
     /// frame is cancelled when user input arrives while it is being written
     /// (the proxy stays on screen). Returns whether it was cancelled and the
@@ -586,14 +749,43 @@ impl<'a> Viewer<'a> {
             disp_h.round().max(1.0) as u32,
         );
         let (iw0, ih0) = self.dims();
-        let full = !self.pic.is_animated()
+        let mut full = !self.pic.is_animated()
             && crop.0 < 0.5
             && crop.1 < 0.5
             && crop.2 >= iw0 - 0.5
             && crop.3 >= ih0 - 0.5;
 
+        // Over ssh above 100%, send the visible pixels at the picture's own
+        // resolution (from 4x enlarged by a whole factor with nearest
+        // neighbour, so pixels stay crisp) and let the terminal scale them to
+        // whole cells: several times less data than an enlarged frame.
+        let scaled = self.remote && z > 1.0 + 1e-9 && self.pic.svg.is_none();
+        let mut cells: Option<(u32, u32)> = None;
         let (level, scale) = self.source_for(z);
-        let raster: Cow<Raster> = if let Some(tree) = &self.pic.svg {
+        let raster: Cow<Raster> = if scaled {
+            let ac = (aw / cw).round().max(1.0);
+            let ar = (ah / ch).round().max(1.0);
+            let cols = (disp_w / cw).round().clamp(1.0, ac);
+            let rows = (disp_h / ch).round().clamp(1.0, ar);
+            let sw = (cols * cw / z).min(iw0);
+            let sh = (rows * ch / z).min(ih0);
+            let sx = (self.cx - sw / 2.0).clamp(0.0, iw0 - sw);
+            let sy = (self.cy - sh / 2.0).clamp(0.0, ih0 - sh);
+            let x0 = sx.round().min(iw0 - 1.0);
+            let y0 = sy.round().min(ih0 - 1.0);
+            let w0 = sw.round().clamp(1.0, iw0 - x0);
+            let h0 = sh.round().clamp(1.0, ih0 - y0);
+            let n = if z >= 4.0 { z.floor() } else { 1.0 };
+            cells = Some((cols as u32, rows as u32));
+            full = full && x0 == 0.0 && y0 == 0.0 && w0 == iw0 && h0 == ih0;
+            Cow::Owned(resize_region(
+                &self.pic.frames[self.frame].raster,
+                (x0, y0, w0, h0),
+                (w0 * n) as u32,
+                (h0 * n) as u32,
+                Filter::Nearest,
+            ))
+        } else if let Some(tree) = &self.pic.svg {
             Cow::Owned(render_svg(tree, crop, dw, dh))
         } else {
             let src = if level == 0 {
@@ -621,6 +813,10 @@ impl<'a> Viewer<'a> {
             Some(c) if raster.ch == 4 => Cow::Owned(raster.flatten(c)),
             _ => raster,
         };
+        let (rw, rh) = (raster.w, raster.h);
+        crate::app::trace(format!(
+            "render {rw}x{rh} for {dw}x{dh} {filter:?}: pixels ready"
+        ));
 
         let k = &self.ctx.kitty;
         let new_id = self.ids[1 - self.cur];
@@ -630,10 +826,15 @@ impl<'a> Viewer<'a> {
         let off_x = ((aw - dw as f64) / 2.0).max(0.0);
         let off_y = ((ah - dh as f64) / 2.0).max(0.0);
         if k.placeholders {
-            let cols = (dw as f64 / cw).round().max(1.0) as u32;
-            let rows = (dh as f64 / ch).round().max(1.0) as u32;
-            let col0 = (off_x / cw).round() as u32;
-            let row0 = (off_y / ch).round() as u32;
+            let (cols, rows) = cells.unwrap_or((
+                (dw as f64 / cw).round().max(1.0) as u32,
+                (dh as f64 / ch).round().max(1.0) as u32,
+            ));
+            // Same window offset as the proxy grid uses, so nothing shifts.
+            let ac = (aw / cw).round().max(1.0);
+            let ar = (ah / ch).round().max(1.0);
+            let col0 = ((ac - cols as f64) / 2.0).floor().max(0.0) as u32;
+            let row0 = ((ar - rows as f64) / 2.0).floor().max(0.0) as u32;
             k.transmit(
                 &mut out,
                 &raster,
@@ -652,6 +853,15 @@ impl<'a> Viewer<'a> {
                 );
             }
         } else {
+            // A terminal-scaled frame fills whole cells.
+            let (off_x, off_y, size) = match cells {
+                Some((c, r)) => (
+                    ((aw - c as f64 * cw) / 2.0).max(0.0),
+                    ((ah - r as f64 * ch) / 2.0).max(0.0),
+                    format!("c={c},r={r},"),
+                ),
+                None => (off_x, off_y, String::new()),
+            };
             let col = (off_x / cw).floor();
             let row = (off_y / ch).floor();
             let xo = ((off_x - col * cw).floor() as u32).min(cw as u32 - 1);
@@ -663,7 +873,7 @@ impl<'a> Viewer<'a> {
                 &mut out,
                 &raster,
                 &format!(
-                    "a=T,i={new_id},p=1,X={xo},Y={yo},C=1,{}",
+                    "a=T,i={new_id},p=1,{size}X={xo},Y={yo},C=1,{}",
                     crate::kitty::Z_BELOW_BG
                 ),
             );
@@ -674,12 +884,13 @@ impl<'a> Viewer<'a> {
         }
         self.hide_proxy(&mut out);
         if self.proxy.as_ref().is_some_and(|p| p.bg != self.bg) {
-            self.drop_proxy(&mut out);
+            self.drop_all_proxies(&mut out);
         }
         self.cur = 1 - self.cur;
         self.shown = true;
         out.extend_from_slice(self.status(ws).as_bytes());
         out.extend_from_slice(b"\x1b[?2026l");
+        crate::app::trace(format!("render: encoded {} KB", out.len() / 1024));
         let mut evs = Vec::new();
         if interruptible {
             let (cut, read) = write_interruptible(&out);
@@ -697,7 +908,8 @@ impl<'a> Viewer<'a> {
         } else {
             self.ctx.write(&out);
         }
-        self.shown_full = full.then_some((dw, dh, self.bg));
+        crate::app::trace("render: written");
+        self.shown_full = full.then_some((rw, rh, self.bg));
         if filter == Filter::Lanczos {
             self.last_render = t0.elapsed();
         }
@@ -745,7 +957,7 @@ impl<'a> Viewer<'a> {
 
     fn clear(&mut self) {
         let mut out = Vec::new();
-        self.drop_proxy(&mut out);
+        self.drop_all_proxies(&mut out);
         for id in self.ids {
             self.ctx.kitty.delete(&mut out, id);
         }
@@ -782,6 +994,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         bg: Background::from_u8(BACKGROUND.load(Ordering::Relaxed)),
         remote: ctx.kitty.compress && ctx.kitty.transfer == Transfer::Direct,
         proxy: None,
+        spare: None,
         on_proxy: false,
         shown_full: None,
     };
