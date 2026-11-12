@@ -1,6 +1,6 @@
 //! Video player: ffmpeg decodes and scales frames to the exact pixel size of
 //! the terminal, frames are streamed with the kitty graphics protocol
-//! (shared memory / temp file locally, zlib-compressed direct over ssh) and
+//! (shared memory / temp file locally, PNG-compressed direct over ssh) and
 //! audio plays through ffplay.
 
 use std::io::Read;

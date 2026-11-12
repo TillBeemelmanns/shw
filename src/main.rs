@@ -709,7 +709,7 @@ fn doctor(ctx: &Ctx) {
     println!(
         "  transfer mode        {}{}",
         ctx.kitty.transfer,
-        if ctx.kitty.compress { " + zlib" } else { "" }
+        if ctx.kitty.compress { " + png" } else { "" }
     );
     println!("  unicode placeholders {}", yes(ctx.kitty.placeholders));
     println!(

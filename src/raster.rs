@@ -65,6 +65,27 @@ impl Raster {
         }
     }
 
+    /// Composite an RGBA raster over a solid colour, giving opaque RGB.
+    pub fn flatten(&self, bg: [u8; 3]) -> Raster {
+        if self.ch != 4 {
+            return self.clone();
+        }
+        let mut data = Vec::with_capacity((self.w * self.h * 3) as usize);
+        for p in self.data.as_chunks::<4>().0 {
+            let a = p[3] as u32;
+            for c in 0..3 {
+                let v = (p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255;
+                data.push(v as u8);
+            }
+        }
+        Raster {
+            w: self.w,
+            h: self.h,
+            ch: 3,
+            data,
+        }
+    }
+
     pub fn rotate90(&self) -> Raster {
         let (w, h, ch) = (self.w as usize, self.h as usize, self.ch as usize);
         let mut data = vec![0u8; self.data.len()];
@@ -663,6 +684,21 @@ pub fn warm_fonts() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_composites_over_background() {
+        let r = Raster {
+            w: 3,
+            h: 1,
+            ch: 4,
+            data: vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 0, 128],
+        };
+        let white = r.flatten([255, 255, 255]);
+        assert_eq!(white.ch, 3);
+        assert_eq!(white.data, vec![255, 0, 0, 255, 255, 255, 127, 127, 127]);
+        let black = r.flatten([0, 0, 0]);
+        assert_eq!(black.data, vec![255, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn heading_font_coverage() {

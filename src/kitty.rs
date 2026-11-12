@@ -1,6 +1,6 @@
 //! Kitty graphics protocol encoder.
 //!
-//! Supports direct (base64 + optional zlib, works over ssh), temp-file and
+//! Supports direct (base64, optionally PNG-compressed, works over ssh), temp-file and
 //! shared-memory transmission, tmux passthrough, and Unicode placeholders.
 
 use std::io::Write;
@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use base64::Engine;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ExtendedColorType, ImageEncoder};
 
 use crate::diacritics::DIACRITICS;
 use crate::raster::Raster;
@@ -232,20 +232,16 @@ impl Kitty {
             }
             Transfer::Direct => {}
         }
-        let mut compressed = None;
+        // Over ssh, send PNG: its per-row prediction filters shrink photos far
+        // more than zlib on raw pixels (~40% less), and fast PNG encodes quicker.
         if self.compress && img.data.len() > 4096 {
-            let mut enc =
-                ZlibEncoder::new(Vec::with_capacity(img.data.len() / 2), Compression::fast());
-            if enc.write_all(&img.data).is_ok() {
-                compressed = enc.finish().ok();
+            if let Some(png) = encode_png(img) {
+                let ctrl = format!("{keys},q=2,f=100");
+                self.write_chunks(out, &ctrl, b64.encode(png).as_bytes());
+                return;
             }
         }
-        let (ctrl, payload) = match &compressed {
-            Some(z) => (format!("{base},o=z"), z),
-            None => (base, &img.data),
-        };
-        let encoded = b64.encode(payload);
-        self.write_chunks(out, &ctrl, encoded.as_bytes());
+        self.write_chunks(out, &base, b64.encode(&img.data).as_bytes());
     }
 
     fn write_chunks(&self, out: &mut Vec<u8>, ctrl: &str, data: &[u8]) {
@@ -274,16 +270,38 @@ impl Kitty {
     }
 }
 
+/// Fast, filtered PNG encoding of a raster (`None` if it fails).
+pub fn encode_png(img: &Raster) -> Option<Vec<u8>> {
+    let color = if img.ch == 4 {
+        ExtendedColorType::Rgba8
+    } else {
+        ExtendedColorType::Rgb8
+    };
+    let mut png = Vec::with_capacity(img.data.len() / 2);
+    PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(&img.data, img.w, img.h, color)
+        .ok()?;
+    Some(png)
+}
+
 /// Text for one row of Unicode placeholder cells referencing image `id`.
 pub fn placeholder_row(id: u32, row: u32, cols: u32) -> String {
+    placeholder_row_at(id, row, 0, cols)
+}
+
+/// Like [`placeholder_row`], but showing `cols` cells of the image's cell
+/// grid starting at column `col` (following cells continue the column).
+pub fn placeholder_row_at(id: u32, row: u32, col: u32, cols: u32) -> String {
     let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
     let mut s = format!("\x1b[38;2;{r};{g};{b}m");
-    let rd = DIACRITICS[(row as usize).min(DIACRITICS.len() - 1)];
+    let last = DIACRITICS.len() - 1;
+    let rd = DIACRITICS[(row as usize).min(last)];
+    let cd = DIACRITICS[(col as usize).min(last)];
     for c in 0..cols {
         s.push('\u{10EEEE}');
         if c == 0 {
             s.push(rd);
-            s.push(DIACRITICS[0]);
+            s.push(cd);
         }
     }
     s.push_str("\x1b[39m");
@@ -318,6 +336,47 @@ mod tests {
             tmux_wrap("\x1b_Gx\x1b\\"),
             "\x1bPtmux;\x1b\x1b_Gx\x1b\x1b\\\x1b\\"
         );
+    }
+
+    #[test]
+    fn compressed_transfer_uses_png() {
+        let k = Kitty {
+            transfer: Transfer::Direct,
+            tmux: false,
+            compress: true,
+            placeholders: false,
+        };
+        let img = Raster {
+            w: 64,
+            h: 64,
+            ch: 3,
+            data: (0..64 * 64 * 3).map(|i| (i % 251) as u8).collect(),
+        };
+        let mut out = Vec::new();
+        k.transmit(&mut out, &img, "a=t,i=9");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b_Ga=t,i=9,q=2,f=100,m="));
+        let png = encode_png(&img).unwrap();
+        let back = image::load_from_memory(&png).unwrap().to_rgb8();
+        assert_eq!(back.into_raw(), img.data);
+    }
+
+    #[test]
+    fn placeholder_row_offsets() {
+        let s = placeholder_row_at(0x010203, 2, 5, 3);
+        assert!(s.starts_with("\x1b[38;2;1;2;3m"));
+        let cells: Vec<char> = s.chars().filter(|c| !c.is_ascii()).collect();
+        assert_eq!(
+            cells,
+            vec![
+                '\u{10EEEE}',
+                DIACRITICS[2],
+                DIACRITICS[5],
+                '\u{10EEEE}',
+                '\u{10EEEE}'
+            ]
+        );
+        assert_eq!(placeholder_row(7, 1, 4), placeholder_row_at(7, 1, 0, 4));
     }
 
     #[test]

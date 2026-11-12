@@ -21,9 +21,10 @@ shw ~/Pictures         # browse a folder (n / p)
   - Images are drawn **1:1 at native pixel resolution** with Lanczos3 SIMD resampling and EXIF orientation.
   - **Zoom** with the mouse wheel (anchored at the pointer) or `+` / `-`. Pan by dragging or with `hjkl`.
     `0` fits the window, `1` shows actual pixels. Above 400 % pixels are drawn crisp (nearest neighbour).
+  - Transparent images can be shown over a white or black background (`b` toggles transparent / white / black).
   - Animated GIF, WebP and APNG playback. Neighbouring files are decoded in the background, so `n` / `p` feel instant.
 - **Videos** (anything ffmpeg can decode). ffmpeg scales each frame to the exact pixel size of the terminal.
-  Frames are sent through shared memory locally, or zlib-compressed over ssh.
+  Frames are sent through shared memory locally, or PNG-compressed over ssh.
   - Play/pause, seeking (arrow keys or a click on the progress bar), frame stepping, loop, mute,
     **zoom and pan inside the video**, and saving a frame as PNG.
   - Audio via `ffplay`; it is turned off automatically over ssh.
@@ -170,8 +171,10 @@ shw --completions fish > ~/.config/fish/completions/shw.fish
 | Konsole | ✅ basic |
 | others | ❌ `shw` reports that the protocol is missing |
 
-- **ssh**: works out of the box. Data is sent inline and zlib-compressed. Video frames are capped
-  at 640×360 and 30 fps for smooth playback over a network, and the terminal scales them up.
+- **ssh**: works out of the box. Data is sent inline and PNG-compressed. When you zoom or pan an image,
+  shw uploads a downscaled copy once and moves it in the terminal (a few bytes per step, also inside
+  tmux); one sharp frame follows when you stop. Video frames are capped at 640×360 and 30 fps for
+  smooth playback over a network, and the terminal scales them up.
 - **tmux**: enable passthrough with `set -g allow-passthrough on`. shw then uses Unicode placeholders automatically.
 - Run `shw --doctor` to see what was detected.
 
