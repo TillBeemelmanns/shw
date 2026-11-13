@@ -291,7 +291,9 @@ fn run() -> Result<()> {
     let kitty = Kitty {
         transfer,
         tmux: env.tmux,
-        compress: env.ssh,
+        // Pixels sent inline (ssh, tmux) are PNG-compressed: tmux and the
+        // terminal parse every byte, so 10x less data shows up much sooner.
+        compress: env.ssh || env.tmux,
         placeholders: cli.placeholders || env.tmux || env.fzf.is_some(),
     };
     let ctx = Ctx {

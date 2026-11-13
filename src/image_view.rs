@@ -111,6 +111,10 @@ struct Proxy {
 }
 
 /// Where the visible window falls in a proxy's placeholder grid.
+/// A rectangle (x, y, w, h) and an (x, y) pair, in pixels.
+type Rect = (f64, f64, f64, f64);
+type Pair = (f64, f64);
+
 struct GridLayout {
     /// Grid size in cells (columns, rows).
     grid: (u32, u32),
@@ -236,16 +240,49 @@ fn placeholder_heads(id: u32, (row0, col0): (u32, u32), (sr, sc): (u32, u32), vr
     s
 }
 
-/// Visible part of a `grid`-cell long axis in `avail` cells around `center`:
-/// (first grid cell, number of cells, screen offset in cells).
-fn grid_window(grid: f64, avail: f64, center: f64) -> (u32, u32, u32) {
-    if grid <= avail {
-        (0, grid as u32, ((avail - grid) / 2.0).floor() as u32)
+/// How far the picture can be dragged past the point where it fills the
+/// window (or, when smaller, past the centre), as a fraction of the window.
+const OVERSCROLL: f64 = 0.2;
+
+/// Clamp the view centre on one axis: a picture `len` long seen through a
+/// window `win` long (both in source pixels).
+fn clamp_centre(c: f64, len: f64, win: f64) -> f64 {
+    let (lo, hi) = if len > win {
+        (win / 2.0, len - win / 2.0)
     } else {
-        let start = (center - avail / 2.0).round().clamp(0.0, grid - avail);
-        (start as u32, avail as u32, 0)
-    }
+        (len / 2.0, len / 2.0)
+    };
+    let m = OVERSCROLL * win;
+    c.clamp(lo - m, hi + m)
 }
+
+/// Visible part of a `len` long axis through a `win` long window centred on
+/// `c`: (start, end, offset of the start from the window's start).
+fn visible_span(c: f64, len: f64, win: f64) -> (f64, f64, f64) {
+    let w0 = c - win / 2.0;
+    let a = w0.max(0.0);
+    let b = (w0 + win).min(len).max(a + 1e-6);
+    (a, b, a - w0)
+}
+
+/// Visible part of a `grid`-cell long axis in `avail` cells around `center`:
+/// (first grid cell, number of cells, screen offset in cells, window start in
+/// grid cells, which is negative / past the end when dragged beyond an edge).
+fn grid_window(grid: f64, avail: f64, center: f64) -> (u32, u32, u32, f64) {
+    let start = (center - avail / 2.0).round();
+    let first = start.clamp(0.0, grid);
+    let end = (start + avail).clamp(first, grid);
+    (
+        first as u32,
+        (end - first) as u32,
+        (first - start) as u32,
+        start,
+    )
+}
+
+/// Delay before re-sending a placeholder frame's placement, and how often.
+const NUDGE_DELAY: Duration = Duration::from_millis(150);
+const NUDGES: u8 = 2;
 
 /// Zoom factor per mouse-wheel notch / key press.
 const WHEEL_STEP: f64 = 1.15;
@@ -275,7 +312,8 @@ struct Viewer<'a> {
     /// The picture may contain transparent pixels (RGBA raster or SVG).
     transparent: bool,
     bg: Background,
-    /// Pixels travel over the network (ssh, direct transfer).
+    /// Pixels travel inline through the terminal stream (ssh, tmux: direct
+    /// transfer), so every frame costs its full size in escape codes.
     remote: bool,
     proxy: Option<Proxy>,
     /// The whole-picture proxy, kept in the terminal while a regional proxy
@@ -289,6 +327,9 @@ struct Viewer<'a> {
     /// Placeholder text on screen: (image id, screen row, screen column,
     /// rows, columns). Same layout again → only the row heads are rewritten.
     cells: Option<(u32, u32, u32, u32, u32)>,
+    /// When to re-send the placement of a placeholder frame, and how many
+    /// more times (see `nudge`).
+    nudge_due: Option<(Instant, u8)>,
 }
 
 impl<'a> Viewer<'a> {
@@ -394,24 +435,44 @@ impl<'a> Viewer<'a> {
         self.dims().0 * self.zoom > self.area(ws).0 + 0.5
     }
 
-    /// Clamp the view centre and return the visible source rectangle and the
-    /// display size in pixels.
-    fn view(&mut self, ws: WinSize) -> ((f64, f64, f64, f64), f64, f64) {
+    /// Clamp the view centre and return the visible source rectangle, the
+    /// display size and the screen offset of that rectangle in the image area
+    /// (pixels). The picture may be dragged past its edges by `OVERSCROLL` of
+    /// the window, so the visible part need not be centred.
+    fn view(&mut self, ws: WinSize) -> (Rect, Pair, Pair) {
         let (aw, ah) = self.area(ws);
         let (iw, ih) = self.dims();
         let z = self.zoom;
-        let disp_w = (iw * z).min(aw);
-        let disp_h = (ih * z).min(ah);
-        let src_w = disp_w / z;
-        let src_h = disp_h / z;
-        self.cx = self
-            .cx
-            .clamp(src_w / 2.0, (iw - src_w / 2.0).max(src_w / 2.0));
-        self.cy = self
-            .cy
-            .clamp(src_h / 2.0, (ih - src_h / 2.0).max(src_h / 2.0));
-        let crop = (self.cx - src_w / 2.0, self.cy - src_h / 2.0, src_w, src_h);
-        (crop, disp_w, disp_h)
+        self.cx = clamp_centre(self.cx, iw, aw / z);
+        self.cy = clamp_centre(self.cy, ih, ah / z);
+        let (x0, x1, ox) = visible_span(self.cx, iw, aw / z);
+        let (y0, y1, oy) = visible_span(self.cy, ih, ah / z);
+        let crop = (x0, y0, x1 - x0, y1 - y0);
+        (crop, (crop.2 * z, crop.3 * z), (ox * z, oy * z))
+    }
+
+    /// Whole cells covering the visible `crop` (shown at screen offset `off`):
+    /// (columns, rows), the source rectangle that fills exactly those cells at
+    /// the current zoom, and the screen offset of the cells in pixels.
+    fn cell_fit(&self, ws: WinSize, crop: Rect, off: Pair) -> (Pair, Rect, Pair) {
+        let (cw, ch) = ws.cell();
+        let (aw, ah) = self.area(ws);
+        let (iw, ih) = self.dims();
+        let z = self.zoom;
+        let ac = (aw / cw).round().max(1.0);
+        let ar = (ah / ch).round().max(1.0);
+        let cols = (crop.2 * z / cw).round().clamp(1.0, ac);
+        let rows = (crop.3 * z / ch).round().clamp(1.0, ar);
+        let sw = (cols * cw / z).min(iw);
+        let sh = (rows * ch / z).min(ih);
+        let sx = (crop.0 + crop.2 / 2.0 - sw / 2.0).clamp(0.0, iw - sw);
+        let sy = (crop.1 + crop.3 / 2.0 - sh / 2.0).clamp(0.0, ih - sh);
+        // Centre the cells on where the source rectangle sits on screen.
+        let ox = (off.0 + (sx - crop.0) * z + (sw * z - cols * cw) / 2.0)
+            .clamp(0.0, (aw - cols * cw).max(0.0));
+        let oy = (off.1 + (sy - crop.1) * z + (sh * z - rows * ch) / 2.0)
+            .clamp(0.0, (ah - rows * ch).max(0.0));
+        ((cols, rows), (sx, sy, sw, sh), (ox, oy))
     }
 
     /// Make sure a proxy of the whole picture exists (adopting the frame on
@@ -563,27 +624,23 @@ impl<'a> Viewer<'a> {
         let gr = (rh * z / ch).round().max(1.0);
         let ac = (aw / cw).round().max(1.0);
         let ar = (ah / ch).round().max(1.0);
-        let (sc, vc, col0) = grid_window(gc, ac, (self.cx - rx) * z / cw);
-        let (sr, vr, row0) = grid_window(gr, ar, (self.cy - ry) * z / ch);
+        let (sc, vc, col0, cs) = grid_window(gc, ac, (self.cx - rx) * z / cw);
+        let (sr, vr, row0, rs) = grid_window(gr, ar, (self.cy - ry) * z / ch);
         // Cells after the first in a row continue the column implicitly, so
         // only the first column and the rows need explicit indices.
-        if sc as f64 > MAX_INDEX || (sr + vr) as f64 - 1.0 > MAX_INDEX {
+        if vc == 0 || vr == 0 || sc as f64 > MAX_INDEX || (sr + vr) as f64 - 1.0 > MAX_INDEX {
             return None;
         }
         // Snap the centre to the cell grid so the sharp frame lines up.
-        let cx = if gc > ac {
-            rx + (sc as f64 + ac / 2.0) * cw / z
-        } else {
-            rx + rw / 2.0
-        };
-        let cy = if gr > ar {
-            ry + (sr as f64 + ar / 2.0) * ch / z
-        } else {
-            ry + rh / 2.0
-        };
-        // A region crop clamps the window at its edges: then it does not
-        // show what the view wants.
-        if (cx - self.cx).abs() > cw / z || (cy - self.cy).abs() > ch / z {
+        let cx = rx + (cs + ac / 2.0) * cw / z;
+        let cy = ry + (rs + ar / 2.0) * ch / z;
+        // A region crop ends before the picture does: the part of the picture
+        // in the window must lie inside it.
+        let (iw, ih) = self.dims();
+        let (x0, x1, _) = visible_span(cx, iw, aw / z);
+        let (y0, y1, _) = visible_span(cy, ih, ah / z);
+        let (ex, ey) = (cw / z, ch / z);
+        if x0 < rx - ex || x1 > rx + rw + ex || y0 < ry - ey || y1 > ry + rh + ey {
             return None;
         }
         Some(GridLayout {
@@ -715,7 +772,7 @@ impl<'a> Viewer<'a> {
         let (aw, ah) = self.area(ws);
         let (iw, ih) = self.dims();
         let z = self.zoom;
-        let (crop, disp_w, disp_h) = self.view(ws);
+        let (crop, (disp_w, disp_h), voff) = self.view(ws);
         let (rx, ry, rw, rh) = self.proxy.as_ref().map_or((0.0, 0.0, iw, ih), |p| p.region);
         let (kx, ky) = (pw as f64 / rw, ph as f64 / rh);
         let (x, y, w, h, size, off_x, off_y);
@@ -727,24 +784,18 @@ impl<'a> Viewer<'a> {
             x = (((crop.0 - rx) * kx).round().max(0.0) as u32).min(pw - w);
             y = (((crop.1 - ry) * ky).round().max(0.0) as u32).min(ph - h);
             size = String::new();
-            off_x = ((aw - w as f64) / 2.0).max(0.0);
-            off_y = ((ah - h as f64) / 2.0).max(0.0);
+            off_x = voff.0.min(aw - w as f64).max(0.0);
+            off_y = voff.1.min(ah - h as f64).max(0.0);
         } else {
             // The placement covers whole cells; pick the source rectangle that
             // fills exactly that many cells at the current zoom.
-            let cols = (disp_w / cw).round().clamp(1.0, (aw / cw).round().max(1.0));
-            let rows = (disp_h / ch).round().clamp(1.0, (ah / ch).round().max(1.0));
-            let sw = (cols * cw / z).min(iw);
-            let sh = (rows * ch / z).min(ih);
-            let sx = (self.cx - sw / 2.0).clamp(0.0, iw - sw);
-            let sy = (self.cy - sh / 2.0).clamp(0.0, ih - sh);
+            let ((cols, rows), (sx, sy, sw, sh), off) = self.cell_fit(ws, crop, voff);
             x = (((sx - rx) * kx).round().max(0.0) as u32).min(pw - 1);
             y = (((sy - ry) * ky).round().max(0.0) as u32).min(ph - 1);
             w = ((sw * kx).round() as u32).clamp(1, pw - x);
             h = ((sh * ky).round() as u32).clamp(1, ph - y);
             size = format!("c={},r={},", cols as u32, rows as u32);
-            off_x = ((aw - cols * cw) / 2.0).max(0.0);
-            off_y = ((ah - rows * ch) / 2.0).max(0.0);
+            (off_x, off_y) = off;
         }
         let col = (off_x / cw).floor();
         let row = (off_y / ch).floor();
@@ -812,7 +863,7 @@ impl<'a> Viewer<'a> {
         let (cw, ch) = ws.cell();
         let (aw, ah) = self.area(ws);
         let z = self.zoom;
-        let (crop, disp_w, disp_h) = self.view(ws);
+        let (crop, (disp_w, disp_h), voff) = self.view(ws);
         let (dw, dh) = (
             disp_w.round().max(1.0) as u32,
             disp_h.round().max(1.0) as u32,
@@ -830,16 +881,12 @@ impl<'a> Viewer<'a> {
         // whole cells: several times less data than an enlarged frame.
         let scaled = self.remote && z > 1.0 + 1e-9 && self.pic.svg.is_none();
         let mut cells: Option<(u32, u32)> = None;
+        // Screen offset of the frame in the image area (pixels).
+        let mut off = voff;
         let (level, scale) = self.source_for(z);
         let raster: Cow<Raster> = if scaled {
-            let ac = (aw / cw).round().max(1.0);
-            let ar = (ah / ch).round().max(1.0);
-            let cols = (disp_w / cw).round().clamp(1.0, ac);
-            let rows = (disp_h / ch).round().clamp(1.0, ar);
-            let sw = (cols * cw / z).min(iw0);
-            let sh = (rows * ch / z).min(ih0);
-            let sx = (self.cx - sw / 2.0).clamp(0.0, iw0 - sw);
-            let sy = (self.cy - sh / 2.0).clamp(0.0, ih0 - sh);
+            let ((cols, rows), (sx, sy, sw, sh), cell_off) = self.cell_fit(ws, crop, voff);
+            off = cell_off;
             let x0 = sx.round().min(iw0 - 1.0);
             let y0 = sy.round().min(ih0 - 1.0);
             let w0 = sw.round().clamp(1.0, iw0 - x0);
@@ -893,18 +940,16 @@ impl<'a> Viewer<'a> {
         let old_id = self.ids[self.cur];
         let mut out: Vec<u8> = Vec::with_capacity(raster.data.len() / 2 + 1024);
         out.extend_from_slice(b"\x1b[?2026h");
-        let off_x = ((aw - dw as f64) / 2.0).max(0.0);
-        let off_y = ((ah - dh as f64) / 2.0).max(0.0);
         if k.placeholders {
-            let (cols, rows) = cells.unwrap_or((
-                (dw as f64 / cw).round().max(1.0) as u32,
-                (dh as f64 / ch).round().max(1.0) as u32,
-            ));
-            // Same window offset as the proxy grid uses, so nothing shifts.
             let ac = (aw / cw).round().max(1.0);
             let ar = (ah / ch).round().max(1.0);
-            let col0 = ((ac - cols as f64) / 2.0).floor().max(0.0) as u32;
-            let row0 = ((ar - rows as f64) / 2.0).floor().max(0.0) as u32;
+            let (cols, rows) = cells.unwrap_or((
+                (dw as f64 / cw).round().clamp(1.0, ac) as u32,
+                (dh as f64 / ch).round().clamp(1.0, ar) as u32,
+            ));
+            // Same window offset as the proxy grid uses, so nothing shifts.
+            let col0 = (off.0 / cw).round().clamp(0.0, (ac - cols as f64).max(0.0)) as u32;
+            let row0 = (off.1 / ch).round().clamp(0.0, (ar - rows as f64).max(0.0)) as u32;
             k.transmit(
                 &mut out,
                 &raster,
@@ -926,12 +971,12 @@ impl<'a> Viewer<'a> {
         } else {
             // A terminal-scaled frame fills whole cells.
             let (off_x, off_y, size) = match cells {
-                Some((c, r)) => (
-                    ((aw - c as f64 * cw) / 2.0).max(0.0),
-                    ((ah - r as f64 * ch) / 2.0).max(0.0),
-                    format!("c={c},r={r},"),
+                Some((c, r)) => (off.0, off.1, format!("c={c},r={r},")),
+                None => (
+                    off.0.min(aw - dw as f64).max(0.0),
+                    off.1.min(ah - dh as f64).max(0.0),
+                    String::new(),
                 ),
-                None => (off_x, off_y, String::new()),
             };
             let col = (off_x / cw).floor();
             let row = (off_y / ch).floor();
@@ -986,6 +1031,25 @@ impl<'a> Viewer<'a> {
             self.last_render = t0.elapsed();
         }
         (false, evs)
+    }
+
+    /// Re-send the virtual placement of the placeholder frame on screen (a
+    /// few bytes, no pixels). Ghostty can leave placeholder cells blank when
+    /// they are drawn while the image is still being decoded, and only fills
+    /// them on its next redraw (e.g. after a mouse click); a placement change
+    /// triggers that redraw.
+    fn nudge(&mut self) {
+        if let (true, false, Some((id, _, _, rows, cols))) = (self.shown, self.on_proxy, self.cells)
+        {
+            if id == self.ids[self.cur] {
+                let mut out = Vec::new();
+                self.ctx.kitty.cmd(
+                    &mut out,
+                    &format!("a=p,U=1,i={id},p=1,c={cols},r={rows},q=2"),
+                );
+                self.ctx.write(&out);
+            }
+        }
     }
 
     fn status(&self, ws: WinSize) -> String {
@@ -1065,12 +1129,13 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         mips: Vec::new(),
         transparent,
         bg: Background::from_u8(BACKGROUND.load(Ordering::Relaxed)),
-        remote: ctx.kitty.compress && ctx.kitty.transfer == Transfer::Direct,
+        remote: ctx.kitty.transfer == Transfer::Direct,
         proxy: None,
         spare: None,
         on_proxy: false,
         shown_full: None,
         cells: None,
+        nudge_due: None,
     };
     // Over ssh, zoom / pan by re-placing an uploaded proxy (pointless for
     // animations, which re-send every frame anyway).
@@ -1117,6 +1182,8 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                 if cancelled {
                     // New input arrived: handle it, retry after the next pause.
                     v.hq_due = Some(Instant::now() + REMOTE_SETTLE);
+                } else if ctx.kitty.placeholders && !animated {
+                    v.nudge_due = Some((Instant::now() + NUDGE_DELAY, NUDGES));
                 }
             }
             if animated && !v.paused && v.next_frame.is_none() {
@@ -1133,6 +1200,9 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         if let Some(t) = v.hq_due {
             deadline = deadline.min(t);
         }
+        if let Some((t, _)) = v.nudge_due {
+            deadline = deadline.min(t);
+        }
         if let (Some(t), false, false) = (v.next_frame, v.paused, v.help) {
             deadline = deadline.min(t);
         }
@@ -1143,6 +1213,12 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         };
         let now = Instant::now();
         if evs.is_empty() {
+            if let Some((t, n)) = v.nudge_due {
+                if now >= t {
+                    v.nudge();
+                    v.nudge_due = (n > 1).then(|| (now + NUDGE_DELAY * 3, n - 1));
+                }
+            }
             if v.hq_due.is_some_and(|t| now >= t) {
                 v.hq_due = None;
                 if v.remote && v.drag.is_some() {
@@ -1351,7 +1427,10 @@ pub fn print_inline(ctx: &Ctx, pic: &Picture, ws: WinSize, upscale: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{grid_window, next_boundary, placeholder_frame, placeholder_heads};
+    use super::{
+        clamp_centre, grid_window, next_boundary, placeholder_frame, placeholder_heads,
+        visible_span,
+    };
 
     #[test]
     fn boundaries_skip_escaped_terminators() {
@@ -1397,11 +1476,24 @@ mod tests {
     #[test]
     fn grid_window_centres_and_clamps() {
         // grid smaller than the view: centred, all cells
-        assert_eq!(grid_window(10.0, 20.0, 5.0), (0, 10, 5));
+        assert_eq!(grid_window(10.0, 20.0, 5.0), (0, 10, 5, -5.0));
         // larger: window around the centre
-        assert_eq!(grid_window(100.0, 20.0, 50.0), (40, 20, 0));
-        // clamped at both ends
-        assert_eq!(grid_window(100.0, 20.0, 3.0), (0, 20, 0));
-        assert_eq!(grid_window(100.0, 20.0, 99.0), (80, 20, 0));
+        assert_eq!(grid_window(100.0, 20.0, 50.0), (40, 20, 0, 40.0));
+        // dragged past either end: the window shows empty cells there
+        assert_eq!(grid_window(100.0, 20.0, 7.0), (0, 17, 3, -3.0));
+        assert_eq!(grid_window(100.0, 20.0, 93.0), (83, 17, 0, 83.0));
+    }
+
+    #[test]
+    fn centre_overscrolls_by_a_fifth_of_the_window() {
+        // larger than the window (100 px window over 1000 px): 20 px past an edge
+        assert_eq!(clamp_centre(-500.0, 1000.0, 100.0), 30.0);
+        assert_eq!(clamp_centre(5000.0, 1000.0, 100.0), 970.0);
+        assert_eq!(clamp_centre(400.0, 1000.0, 100.0), 400.0);
+        // smaller: 20 px either side of the centre
+        assert_eq!(clamp_centre(0.0, 50.0, 100.0), 5.0);
+        assert_eq!(clamp_centre(99.0, 50.0, 100.0), 45.0);
+        // fully dragged left: 80 % of the window shows the picture's start
+        assert_eq!(visible_span(30.0, 1000.0, 100.0), (0.0, 80.0, 20.0));
     }
 }
