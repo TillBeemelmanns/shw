@@ -488,8 +488,9 @@ fn status(
 
 pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav> {
     let info = probe(path)?;
-    let remote = ctx.env.ssh || ctx.kitty.transfer == crate::kitty::Transfer::Direct;
-    // Pixel budget per frame: generous locally (shared memory), modest over ssh.
+    let remote = ctx.kitty.network || ctx.kitty.inline();
+    // Pixel budget per frame: generous with shared memory, modest when pixels
+    // go inline (ssh, tmux).
     let max_px = if remote {
         640.0 * 360.0
     } else {

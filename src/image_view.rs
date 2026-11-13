@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind
 
 use crate::app::{is_quit, pos_label, read_events, Ctx, Nav, CHROME_ROWS};
 use crate::diacritics::DIACRITICS;
-use crate::kitty::{next_id, placeholder_row_at, Transfer, Z_BELOW_BG};
+use crate::kitty::{next_id, placeholder_row_at, Z_BELOW_BG};
 use crate::raster::{render_svg, resize, resize_region, Filter, Picture, Raster};
 use crate::term::WinSize;
 use crate::ui::{help_screen, hint_bar, status_bar};
@@ -83,10 +83,13 @@ static BACKGROUND: AtomicU8 = AtomicU8::new(0);
 
 /// Over ssh, how long input must pause before a sharp frame is sent.
 const REMOTE_SETTLE: Duration = Duration::from_millis(300);
+/// The same without a network (local tmux): the sharp frame (~15 ms to
+/// encode) can follow almost at once.
+const LOCAL_SETTLE: Duration = Duration::from_millis(60);
 /// Sharp frames over ssh are written in pieces of at least this size, checking
 /// for user input in between so a new zoom / drag can cancel the frame.
 const INTERRUPT_PIECE: usize = 32 * 1024;
-/// Largest proxy image uploaded once for remote zooming / panning, in pixels.
+/// Largest proxy image uploaded once for inline zooming / panning, in pixels.
 const PROXY_MAX_PIXELS: f64 = 6.0e6;
 /// Largest regional proxy (a crop around the view, used under tmux when the
 /// zoomed picture is too large to address with placeholder cells), in pixels.
@@ -312,9 +315,8 @@ struct Viewer<'a> {
     /// The picture may contain transparent pixels (RGBA raster or SVG).
     transparent: bool,
     bg: Background,
-    /// Pixels travel inline through the terminal stream (ssh, tmux: direct
-    /// transfer), so every frame costs its full size in escape codes.
-    remote: bool,
+    /// Pixels travel inline in the terminal stream (`Kitty::inline`).
+    inline: bool,
     proxy: Option<Proxy>,
     /// The whole-picture proxy, kept in the terminal while a regional proxy
     /// is in use, so zooming back out needs no upload.
@@ -879,7 +881,7 @@ impl<'a> Viewer<'a> {
         // resolution (from 4x enlarged by a whole factor with nearest
         // neighbour, so pixels stay crisp) and let the terminal scale them to
         // whole cells: several times less data than an enlarged frame.
-        let scaled = self.remote && z > 1.0 + 1e-9 && self.pic.svg.is_none();
+        let scaled = self.inline && z > 1.0 + 1e-9 && self.pic.svg.is_none();
         let mut cells: Option<(u32, u32)> = None;
         // Screen offset of the frame in the image area (pixels).
         let mut off = voff;
@@ -1129,7 +1131,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         mips: Vec::new(),
         transparent,
         bg: Background::from_u8(BACKGROUND.load(Ordering::Relaxed)),
-        remote: ctx.kitty.transfer == Transfer::Direct,
+        inline: ctx.kitty.inline(),
         proxy: None,
         spare: None,
         on_proxy: false,
@@ -1137,9 +1139,14 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
         cells: None,
         nudge_due: None,
     };
-    // Over ssh, zoom / pan by re-placing an uploaded proxy (pointless for
+    // With inline pixels (ssh, tmux), zoom / pan by re-placing an uploaded proxy (pointless for
     // animations, which re-send every frame anyway).
-    let use_proxy = v.remote && !animated;
+    let use_proxy = v.inline && !animated;
+    let settle = if ctx.kitty.network {
+        REMOTE_SETTLE
+    } else {
+        LOCAL_SETTLE
+    };
     let mut ws = ctx.size();
     v.reset(ws);
     ctx.write(b"\x1b[0m\x1b[2J");
@@ -1147,7 +1154,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
     let mut interactive = false;
     // The last events only zoomed or panned.
     let mut moved = false;
-    // The pending render is the sharp frame after remote zooming / panning.
+    // The pending render is the sharp frame after inline zooming / panning.
     let mut refine = false;
     // Events read while a cancelled sharp frame was being written.
     let mut pending: Vec<Event> = Vec::new();
@@ -1160,17 +1167,17 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                     help_screen(&ctx.theme, ws.cols, ws.rows, "shw — image viewer", HELP)
                         .as_bytes(),
                 );
-            } else if moved && v.remote {
+            } else if moved && v.inline {
                 // Over ssh, never send pixels per wheel notch / drag step: move the
                 // proxy (or wait), and send one sharp frame once input pauses.
                 if !(use_proxy && v.show_proxy(ws)) {
                     // Nothing new on screen until the sharp frame.
                     v.on_proxy = false;
                 }
-                v.hq_due = Some(Instant::now() + REMOTE_SETTLE);
+                v.hq_due = Some(Instant::now() + settle);
             } else {
                 // While zooming / dragging, draw with a fast filter; refine when idle.
-                let fast = !v.remote && interactive && v.last_render > Duration::from_millis(20);
+                let fast = !v.inline && interactive && v.last_render > Duration::from_millis(20);
                 let filter = if fast {
                     Filter::Bilinear
                 } else {
@@ -1181,7 +1188,7 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
                 pending = evs;
                 if cancelled {
                     // New input arrived: handle it, retry after the next pause.
-                    v.hq_due = Some(Instant::now() + REMOTE_SETTLE);
+                    v.hq_due = Some(Instant::now() + settle);
                 } else if ctx.kitty.placeholders && !animated {
                     v.nudge_due = Some((Instant::now() + NUDGE_DELAY, NUDGES));
                 }
@@ -1221,12 +1228,14 @@ pub fn run(ctx: &Ctx, pic: Picture, name: &str, meta: String, pos: (usize, usize
             }
             if v.hq_due.is_some_and(|t| now >= t) {
                 v.hq_due = None;
-                if v.remote && v.drag.is_some() {
-                    // Mouse button still held mid-drag: no sharp frame yet.
-                    v.hq_due = Some(now + REMOTE_SETTLE);
+                if ctx.kitty.network && v.drag.is_some() {
+                    // Over ssh, mouse button still held mid-drag: no sharp
+                    // frame yet (locally it is cheap, and cancelled by the
+                    // next drag step anyway).
+                    v.hq_due = Some(now + settle);
                 } else if !v.on_proxy || v.needs_refine() {
                     dirty = true;
-                    refine = v.remote;
+                    refine = v.inline;
                 }
             }
             if let Some(t) = v.next_frame {

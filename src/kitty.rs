@@ -183,16 +183,31 @@ pub fn tmux_wrap(s: &str) -> String {
     o
 }
 
+/// How images reach the terminal. Decided once at startup from the
+/// environment (ssh, tmux, fzf) and the command line; views only ask these
+/// questions, never about the environment itself.
 #[derive(Clone, Debug)]
 pub struct Kitty {
     pub transfer: Transfer,
+    /// Wrap escape codes in tmux passthrough.
     pub tmux: bool,
+    /// Send inline pixels as PNG.
     pub compress: bool,
     /// Use Unicode placeholders instead of direct placements.
     pub placeholders: bool,
+    /// Pixels cross a network link (ssh): every frame costs bandwidth and
+    /// latency, so views send fewer, smaller frames.
+    pub network: bool,
 }
 
 impl Kitty {
+    /// Pixels travel inline in the terminal stream (base64 escape codes)
+    /// instead of through a temp file or shared memory, so every frame costs
+    /// its full size to write and for the terminal (and tmux) to parse.
+    pub fn inline(&self) -> bool {
+        self.transfer == Transfer::Direct
+    }
+
     fn push(&self, out: &mut Vec<u8>, esc: &str) {
         if self.tmux {
             out.extend_from_slice(tmux_wrap(esc).as_bytes());
@@ -319,6 +334,7 @@ mod tests {
             tmux: false,
             compress: false,
             placeholders: false,
+            network: false,
         };
         let img = Raster {
             w: 64,
@@ -345,6 +361,7 @@ mod tests {
             tmux: false,
             compress: true,
             placeholders: false,
+            network: false,
         };
         let img = Raster {
             w: 64,

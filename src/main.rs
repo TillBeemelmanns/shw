@@ -295,6 +295,7 @@ fn run() -> Result<()> {
         // terminal parse every byte, so 10x less data shows up much sooner.
         compress: env.ssh || env.tmux,
         placeholders: cli.placeholders || env.tmux || env.fzf.is_some(),
+        network: env.ssh,
     };
     let ctx = Ctx {
         env,
