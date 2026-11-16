@@ -5,7 +5,9 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -308,24 +310,110 @@ fn spawn_pipeline(
     })
 }
 
-fn spawn_audio(path: &str, at: f64) -> Option<Child> {
-    Command::new(tool("ffplay")?)
-        .args([
-            "-nodisp",
-            "-autoexit",
-            "-vn",
-            "-sn",
-            "-loglevel",
-            "quiet",
-            "-ss",
-            &format!("{:.3}", at.max(0.0)),
-            path,
-        ])
+/// Audio playback: ffmpeg seeks and decodes to wav, ffplay plays it from a
+/// pipe. (ffplay's own `-ss` is ignored for mp4 in ffmpeg 9.) ffplay's
+/// status line carries its audio clock, which already accounts for the
+/// output latency; the video clock is slaved to it, so the picture waits for
+/// the sound device to open (~0.5s on macOS) instead of running ahead.
+struct Audio {
+    decoder: Child,
+    player: Child,
+    at: f64,
+    started: Instant,
+    reported: Arc<Mutex<Option<(f64, Instant)>>>,
+    exited: Arc<AtomicBool>,
+}
+
+impl Audio {
+    /// Media time the listener hears now, from a recent ffplay report.
+    fn now(&self) -> Option<f64> {
+        let (t, when) = (*self.reported.lock().ok()?)?;
+        let age = when.elapsed();
+        (age < Duration::from_millis(500)).then_some(self.at + t + age.as_secs_f64())
+    }
+    /// ffplay is still opening the audio device: hold the video.
+    fn starting(&self) -> bool {
+        !self.exited.load(Ordering::Relaxed)
+            && self.reported.lock().is_ok_and(|r| r.is_none())
+            && self.started.elapsed() < Duration::from_secs(2)
+    }
+}
+
+impl Drop for Audio {
+    fn drop(&mut self) {
+        for c in [&mut self.player, &mut self.decoder] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// The master clock from an ffplay status line (`  1.23 M-A: ...`).
+fn parse_ffplay_clock(line: &str) -> Option<f64> {
+    let (head, _) = line.split_once("M-A:")?;
+    let t: f64 = head.split_whitespace().last()?.parse().ok()?;
+    t.is_finite().then_some(t)
+}
+
+fn spawn_audio(path: &str, at: f64) -> Option<Audio> {
+    let ffplay = tool("ffplay")?;
+    let mut decoder = Command::new(tool("ffmpeg")?)
+        .args(["-hide_banner", "-loglevel", "quiet", "-nostdin"])
+        .args(["-ss", &format!("{:.3}", at.max(0.0)), "-i", path])
+        .args(["-vn", "-sn", "-dn", "-f", "wav", "-"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()
+        .ok()?;
+    let pcm = decoder.stdout.take()?;
+    let mut player = match Command::new(ffplay)
+        .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-stats", "-"])
+        .stdin(Stdio::from(pcm))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = decoder.kill();
+            let _ = decoder.wait();
+            return None;
+        }
+    };
+    let reported = Arc::new(Mutex::new(None));
+    let exited = Arc::new(AtomicBool::new(false));
+    if let Some(mut err) = player.stderr.take() {
+        let reported = Arc::clone(&reported);
+        let exited = Arc::clone(&exited);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let mut line = Vec::new();
+            while let Ok(n @ 1..) = err.read(&mut buf) {
+                for &b in &buf[..n] {
+                    if b == b'\r' || b == b'\n' {
+                        if let Some(t) = parse_ffplay_clock(&String::from_utf8_lossy(&line)) {
+                            if let Ok(mut r) = reported.lock() {
+                                *r = Some((t, Instant::now()));
+                            }
+                        }
+                        line.clear();
+                    } else if line.len() < 256 {
+                        line.push(b);
+                    }
+                }
+            }
+            exited.store(true, Ordering::Relaxed);
+        });
+    }
+    Some(Audio {
+        decoder,
+        player,
+        at: at.max(0.0),
+        started: Instant::now(),
+        reported,
+        exited,
+    })
 }
 
 struct Clock {
@@ -536,14 +624,19 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
     let mut step = false;
     ctx.write(b"\x1b[0m\x1b[2J");
 
-    let kill_audio = |a: &mut Option<Child>| {
-        if let Some(mut c) = a.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    };
-
     let nav = loop {
+        // ---- follow the audio clock
+        if !clock.paused && !help {
+            if let Some(a) = &audio {
+                if let Some(t) = a.now() {
+                    if (t - clock.now()).abs() > 0.03 {
+                        clock.set(t);
+                    }
+                } else if a.starting() {
+                    clock.set(a.at);
+                }
+            }
+        }
         // ---- video frames
         let mut frame: Option<Vec<u8>> = None;
         if !help && (!clock.paused || step) && !pipe.eof {
@@ -579,7 +672,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
         }
         if pipe.eof && !clock.paused {
             if looping {
-                kill_audio(&mut audio);
+                audio = None;
                 pipe = spawn_pipeline(path, 0.0, &info, &lay, max_fps)?;
                 clock.set(0.0);
                 if !muted {
@@ -588,7 +681,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
             } else {
                 clock.base = info.duration.max(clock.now().min(info.duration.max(0.0)));
                 clock.paused = true;
-                kill_audio(&mut audio);
+                audio = None;
                 need_status = true;
             }
         }
@@ -783,7 +876,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                         } else {
                             clock.base = clock.now();
                             clock.paused = true;
-                            kill_audio(&mut audio);
+                            audio = None;
                         }
                     }
                     KeyCode::Right => seek_to = Some(clock.now() + 5.0),
@@ -804,7 +897,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                         } else {
                             muted = !muted;
                             if muted {
-                                kill_audio(&mut audio);
+                                audio = None;
                             } else if !clock.paused {
                                 audio = spawn_audio(path, clock.now());
                             }
@@ -848,7 +941,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
                         ctx.write(&out);
                         clock.base = clock.now();
                         clock.paused = true;
-                        kill_audio(&mut audio);
+                        audio = None;
                     }
                     KeyCode::Char('n') | KeyCode::Tab => {
                         nav = Some(Nav::Next);
@@ -882,7 +975,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
             drop(pipe);
             pipe = spawn_pipeline(path, t, &info, &lay, max_fps)?;
             clock.set(t);
-            kill_audio(&mut audio);
+            audio = None;
             if !clock.paused && !muted {
                 audio = spawn_audio(path, t);
             }
@@ -896,7 +989,7 @@ pub fn run(ctx: &Ctx, path: &str, name: &str, pos: (usize, usize)) -> Result<Nav
             need_status = true;
         }
     };
-    kill_audio(&mut audio);
+    drop(audio);
     let mut out = Vec::new();
     for id in ids {
         ctx.kitty.delete(&mut out, id);
@@ -961,4 +1054,22 @@ pub fn print_inline(ctx: &Ctx, path: &str, name: &str, ws: WinSize) -> Result<()
     crate::pager::print_doc(ctx, &mut doc, ws.cols as usize);
     println!("{line}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ffplay_clock;
+
+    #[test]
+    fn parses_ffplay_status_clock() {
+        let l = "   1.23 M-A:  0.000 fd=   0 aq=   16KB vq=    0KB sq=    0B ";
+        assert_eq!(parse_ffplay_clock(l), Some(1.23));
+        assert_eq!(
+            parse_ffplay_clock("  -0.01 M-A:  0.000 fd=   0"),
+            Some(-0.01)
+        );
+        assert_eq!(parse_ffplay_clock("    nan M-A:    nan fd=   0"), None);
+        assert_eq!(parse_ffplay_clock("    nan    :  0.000 fd=   0"), None);
+        assert_eq!(parse_ffplay_clock("\x1b[2K"), None);
+    }
 }
