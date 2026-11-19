@@ -1133,6 +1133,8 @@ impl<'a> Renderer<'a> {
         let avail_px = cw as f64 * cw_px;
         let mut fallback: Vec<Span> = Vec::new();
         let mut group: Vec<Arc<Raster>> = Vec::new();
+        // the picture of a group that holds a single animated one
+        let mut anim: Option<Arc<Picture>> = None;
         let gap = (cw_px / 2.0).round() as u32;
         let mut group_w = 0u32;
 
@@ -1148,9 +1150,11 @@ impl<'a> Renderer<'a> {
             let (w, h) = self.img_size(&pic, &r, avail_px);
             let raster = self.scaled(key, &pic, w, h);
             if !group.is_empty() && (group_w + gap + raster.w) as f64 > avail_px {
-                self.place_group(std::mem::take(&mut group), gap, ch_px, cw_px);
+                self.place_group(std::mem::take(&mut group), anim.take(), gap, ch_px, cw_px);
                 group_w = 0;
             }
+            // pictures side by side are composed into one still image
+            anim = (group.is_empty() && pic.is_animated()).then(|| pic.clone());
             group_w += if group.is_empty() {
                 raster.w
             } else {
@@ -1159,7 +1163,8 @@ impl<'a> Renderer<'a> {
             group.push(raster);
         }
         if !group.is_empty() {
-            self.place_group(group, gap, ch_px, cw_px);
+            let anim = anim.filter(|_| group.len() == 1);
+            self.place_group(group, anim, gap, ch_px, cw_px);
         }
         if !fallback.is_empty() {
             self.emit_text(fallback);
@@ -1172,7 +1177,14 @@ impl<'a> Renderer<'a> {
         cached.or_insert_with(|| Arc::new(pic.render(w, h))).clone()
     }
 
-    fn place_group(&mut self, group: Vec<Arc<Raster>>, gap: u32, ch_px: f64, cw_px: f64) {
+    fn place_group(
+        &mut self,
+        group: Vec<Arc<Raster>>,
+        anim: Option<Arc<Picture>>,
+        gap: u32,
+        ch_px: f64,
+        cw_px: f64,
+    ) {
         let raster = match &group[..] {
             [one] => one.clone(),
             _ => Arc::new(compose_row(&group, gap)),
@@ -1180,6 +1192,9 @@ impl<'a> Renderer<'a> {
         let cols = (raster.w as f64 / cw_px).ceil().max(1.0) as u32;
         let rows = (raster.h as f64 / ch_px).ceil().max(1.0) as u32;
         self.place(raster, cols, rows, String::new());
+        if let Some(pic) = anim.filter(|_| group.len() == 1) {
+            self.doc.animate(pic);
+        }
     }
 
     // -- code ----------------------------------------------------------------
@@ -1199,7 +1214,7 @@ impl<'a> Renderer<'a> {
                 let (w, h) = self.img_size(&pic, &r, avail);
                 let raster = self.scaled(&key, &pic, w, h);
                 self.center.push(true);
-                self.place_group(vec![raster], 0, self.o.cell.1, self.o.cell.0);
+                self.place_group(vec![raster], None, 0, self.o.cell.1, self.o.cell.0);
                 self.center.pop();
                 return;
             }

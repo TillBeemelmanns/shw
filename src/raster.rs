@@ -210,7 +210,12 @@ impl Picture {
                 h,
             );
         }
-        resize(&self.frames[0].raster, w, h)
+        self.render_frame(0, w, h)
+    }
+
+    /// Render raster frame `i` at exactly `w` x `h`.
+    pub fn render_frame(&self, i: usize, w: u32, h: u32) -> Raster {
+        resize(&self.frames[i % self.frames.len()].raster, w, h)
     }
 }
 

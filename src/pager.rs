@@ -1,7 +1,8 @@
 //! Scrollable document viewer (markdown, code, text) with inline images,
 //! search and mouse wheel scrolling; plus the non-interactive printer.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
@@ -132,6 +133,50 @@ fn place_image(
     }
 }
 
+/// When the next frame of an animated picture on screen is due (now for one
+/// that just appeared and still needs its timing started).
+fn next_frame_due(doc: &Doc) -> Option<Instant> {
+    let now = Instant::now();
+    doc.images
+        .iter()
+        .filter(|im| im.sent)
+        .filter_map(|im| Some(im.anim.as_ref()?.due.unwrap_or(now)))
+        .min()
+}
+
+/// Step the animated pictures on screen whose next frame is due: the new
+/// frame replaces the image with the next draw. Pictures that are not shown
+/// pause and start their timing afresh when they appear again. Returns true
+/// if a frame changed.
+fn advance_animations(ctx: &Ctx, doc: &mut Doc, st: &mut State) -> bool {
+    let now = Instant::now();
+    let mut changed = false;
+    for im in &mut doc.images {
+        let Some(a) = &mut im.anim else {
+            continue;
+        };
+        if !im.sent {
+            a.due = None;
+            continue;
+        }
+        let delay = |a: &crate::doc::Anim| a.pic.frames[a.frame].delay;
+        let Some(due) = a.due.filter(|&d| d <= now) else {
+            if a.due.is_none() {
+                a.due = Some(now + delay(a));
+            }
+            continue;
+        };
+        a.frame = (a.frame + 1) % a.pic.frames.len();
+        // do not race to catch up after a stall
+        a.due = Some(due.max(now - Duration::from_millis(200)) + delay(a));
+        im.raster = Arc::new(a.pic.render_frame(a.frame, a.w, a.h));
+        ctx.kitty.delete(&mut st.stale, im.id);
+        im.sent = false;
+        changed = true;
+    }
+    changed
+}
+
 /// Lay the document out again (new size, theme or content) and keep the
 /// reading position. The old images are freed with the next frame.
 fn relayout(ctx: &Ctx, src: &mut dyn Source, doc: &mut Doc, st: &mut State, ws: WinSize) {
@@ -188,11 +233,17 @@ pub fn run(ctx: &Ctx, src: &mut dyn Source, pos: (usize, usize)) -> Result<Nav> 
             dirty = false;
         }
         // while pictures load in the background, look for them regularly
-        let timeout = match src.loading() {
+        let mut timeout = match src.loading() {
             0 => Duration::from_secs(3600),
             _ => Duration::from_millis(40),
         };
+        if let Some(due) = next_frame_due(&doc) {
+            timeout = timeout.min(due.saturating_duration_since(Instant::now()));
+        }
         let evs = read_events(timeout)?;
+        if advance_animations(ctx, &mut doc, &mut st) {
+            dirty = true;
+        }
         if src.poll() {
             relayout(ctx, src, &mut doc, &mut st, ws);
             dirty = true;

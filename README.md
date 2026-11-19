@@ -38,7 +38,7 @@ shw ~/Pictures         # browse a folder (n / p)
   - syntax-highlighted code blocks, tables with alignment and zebra striping, task lists, numbered footnotes,
     and `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` alerts
   - `:emoji:` shortcodes and clickable links (OSC 8), including bare URLs
-  - **inline images** (local files, remote URLs, SVG badges from shields.io), HTML `<img width=…>` and
+  - **inline images** (local files, remote URLs, SVG badges from shields.io; animated GIF, WebP and APNG play), HTML `<img width=…>` and
     `<p align="center">`
   - **diagrams** in fenced code blocks, as on GitHub, drawn in a few milliseconds without external tools:
     `mermaid` (flowcharts, sequence, class, state, ER, gantt, pie, …), `geojson` / `topojson` maps on a

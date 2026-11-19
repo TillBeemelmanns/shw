@@ -2,10 +2,11 @@
 //! markdown / code renderers and consumed by the pager or inline printer.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::raster::Raster;
+use crate::raster::{Picture, Raster};
 use crate::ui::{spans_width, write_spans, Rgb, Span, Style};
 
 pub enum Row {
@@ -40,6 +41,19 @@ pub struct DocImage {
     /// Drawn over text rows that leave room for it (task list checkbox,
     /// picture in a table cell) instead of on rows of its own.
     pub overlay: bool,
+    /// Animation (GIF, WebP, APNG) whose current frame `raster` shows.
+    pub anim: Option<Anim>,
+}
+
+/// Playback state of an animated picture in a document.
+pub struct Anim {
+    pub pic: Arc<Picture>,
+    /// Size the frames are drawn at (px).
+    pub w: u32,
+    pub h: u32,
+    pub frame: usize,
+    /// When the next frame is due; `None` while the picture is not on screen.
+    pub due: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -141,6 +155,7 @@ impl Doc {
             sent: false,
             alt,
             overlay: false,
+            anim: None,
         });
         for r in 0..rows {
             self.rows.push(Row::Image {
@@ -163,7 +178,22 @@ impl Doc {
             sent: false,
             alt: String::new(),
             overlay: true,
+            anim: None,
         });
+    }
+
+    /// Play `pic` in the image added last (which shows its first frame).
+    pub fn animate(&mut self, pic: Arc<Picture>) {
+        if let Some(im) = self.images.last_mut() {
+            let (w, h) = (im.raster.w, im.raster.h);
+            im.anim = Some(Anim {
+                pic,
+                w,
+                h,
+                frame: 0,
+                due: None,
+            });
+        }
     }
 
     pub fn plain(&self, i: usize) -> String {
