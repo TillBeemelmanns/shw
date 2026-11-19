@@ -14,6 +14,10 @@ shw README.md          # GitHub-style markdown with images, tables, alerts, emoj
 shw ~/Pictures         # browse a folder (n / p)
 ```
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/TillBeemelmanns/shw/main/assets/demo.gif" alt="shw demo" width="640">
+</p>
+
 ## Features
 
 - **Images**: PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, QOI, TGA, DDS, HDR, PNM and **SVG** (rendered as vectors,
